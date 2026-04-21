@@ -814,6 +814,24 @@
     </div>
 
     <div class="config-section">
+      <h3>宿主机记忆桶目录 (Docker)</h3>
+      <div style="font-size:12px;color:var(--text-dim);margin-bottom:10px;line-height:1.6;">
+        设置 docker-compose 中 <code>${OMBRE_HOST_VAULT_DIR:-./buckets}:/data</code> 的宿主机路径。
+        留空则使用项目内 <code>./buckets</code>。
+        <span style="color:var(--warning);">⚠ 修改后需在宿主机执行 <code>docker compose down && docker compose up -d</code> 才会生效。</span>
+      </div>
+      <div class="config-row">
+        <label>路径</label>
+        <input type="text" id="settings-host-vault" placeholder="例如 /Users/you/Obsidian/Ombre Brain" style="flex:1;" />
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:6px;">
+        <button class="btn-primary" onclick="saveHostVault()">保存到 .env</button>
+        <button onclick="loadHostVault()" style="font-size:12px;padding:4px 12px;">重新加载</button>
+        <span id="settings-host-vault-msg" style="font-size:12px;"></span>
+      </div>
+    </div>
+
+    <div class="config-section">
       <h3>账号操作</h3>
       <button onclick="doLogout()" style="color:var(--negative);border-color:var(--negative);">退出登录</button>
     </div>
@@ -945,6 +963,61 @@ async function loadSettingsStatus() {
     `;
   } catch(e) {
     el.textContent = '加载失败: ' + e;
+  }
+  // Also refresh the host-vault input whenever the settings tab is loaded.
+  loadHostVault();
+}
+
+async function loadHostVault() {
+  const input = document.getElementById('settings-host-vault');
+  const msg = document.getElementById('settings-host-vault-msg');
+  if (!input) return;
+  msg.textContent = '';
+  msg.style.color = 'var(--text-dim)';
+  try {
+    const resp = await authFetch('/api/host-vault');
+    if (!resp) return;
+    const d = await resp.json();
+    input.value = d.value || '';
+    if (d.source === 'env') {
+      msg.textContent = '当前由进程环境变量提供（修改 .env 不会立即覆盖）';
+      msg.style.color = 'var(--warning)';
+    } else if (d.source === 'file') {
+      msg.textContent = '当前来自 ' + (d.env_file || '.env');
+    } else {
+      msg.textContent = '尚未设置（默认使用 ./buckets）';
+    }
+  } catch(e) {
+    msg.style.color = 'var(--negative)';
+    msg.textContent = '加载失败: ' + e;
+  }
+}
+
+async function saveHostVault() {
+  const input = document.getElementById('settings-host-vault');
+  const msg = document.getElementById('settings-host-vault-msg');
+  if (!input) return;
+  const value = input.value.trim();
+  msg.textContent = '保存中…';
+  msg.style.color = 'var(--text-dim)';
+  try {
+    const resp = await authFetch('/api/host-vault', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({value})
+    });
+    if (!resp) return;
+    const d = await resp.json();
+    if (resp.ok) {
+      msg.style.color = 'var(--accent)';
+      msg.textContent = '已保存 → ' + (d.env_file || '.env') + '（需重启容器生效）';
+    } else {
+      msg.style.color = 'var(--negative)';
+      msg.textContent = d.error || '保存失败';
+    }
+  } catch(e) {
+    msg.style.color = 'var(--negative)';
+    msg.textContent = '保存失败: ' + e;
   }
 }
 

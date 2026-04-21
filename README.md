@@ -591,14 +591,14 @@ Dashboard：浏览器打开 `http://localhost:8000/dashboard`
 > **Free tier won't work**: Render free tier has **no persistent disk** — all memory data is lost on restart. It also sleeps on inactivity. **Starter plan ($7/mo) or above is required.**
 
 项目根目录已包含 `render.yaml`，点击按钮后：
-1. （可选）设置 `OMBRE_API_KEY`：任何 OpenAI 兼容 API 的 key，不填则自动降级为本地关键词提取
+1. 设置 `OMBRE_API_KEY`：任何 OpenAI 兼容 API 的 key（**必需**，未设置时 hold/grow 会报错、仅检索类工具可用）
 2. （可选）设置 `OMBRE_BASE_URL`：API 地址，支持任意 OpenAI 化地址，如 `https://api.deepseek.com/v1` / `http://123.1.1.1:7689/v1` / `http://your-ollama:11434/v1`
 3. Render 自动挂载持久化磁盘到 `/opt/render/project/src/buckets`
 4. Dashboard：`https://<你的服务名>.onrender.com/dashboard`
 5. 部署后 MCP URL：`https://<你的服务名>.onrender.com/mcp`
 
 `render.yaml` is included. After clicking the button:
-1. (Optional) `OMBRE_API_KEY`: any OpenAI-compatible key; omit to fall back to local keyword extraction
+1. `OMBRE_API_KEY`: any OpenAI-compatible key (**required** for hold/grow; without it those tools raise an error)
 2. (Optional) `OMBRE_BASE_URL`: any OpenAI-compatible endpoint, e.g. `https://api.deepseek.com/v1`, `http://123.1.1.1:7689/v1`, `http://your-ollama:11434/v1`
 3. Persistent disk auto-mounts at `/opt/render/project/src/buckets`
 4. Dashboard: `https://<your-service>.onrender.com/dashboard`
@@ -620,7 +620,7 @@ Dashboard：浏览器打开 `http://localhost:8000/dashboard`
    - Zeabur auto-detects the `Dockerfile` in root and builds via Docker
 
 2. **设置环境变量 / Set environment variables**（服务页面 → **Variables** 标签页）
-   - `OMBRE_API_KEY`（可选）— LLM API 密钥，不填则自动降级为本地关键词提取
+   - `OMBRE_API_KEY`（**必需**）— LLM API 密钥；未设置时 hold/grow/dream 会报错
    - `OMBRE_BASE_URL`（可选）— API 地址，如 `https://api.deepseek.com/v1`
 
    > ⚠️ **不需要**手动设置 `OMBRE_TRANSPORT` 和 `OMBRE_BUCKETS_DIR`，Dockerfile 里已经设好了默认值。Zeabur 对单阶段 Dockerfile 会自动注入控制台设置的环境变量。

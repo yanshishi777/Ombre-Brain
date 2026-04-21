@@ -65,7 +65,7 @@
 **自动化处理**
 - 存入时 LLM 自动分析 domain/valence/arousal/tags/name
 - 大段日记 LLM 拆分为 2~6 条独立记忆
-- 浮现时自动脱水压缩（LLM 压缩保语义，API 不可用降级到本地关键词提取）
+- 浮现时自动脱水压缩（LLM 压缩保语义，API 不可用时直接报错，无静默降级）
 - Wikilink `[[]]` 由 LLM 在内容中标记
 
 ---
@@ -168,7 +168,7 @@
 **迁移/批处理工具**：`migrate_to_domains.py`、`reclassify_domains.py`、`reclassify_api.py`、`backfill_embeddings.py`、`write_memory.py`、`check_buckets.py`、`import_memory.py`（历史对话导入引擎）
 
 **降级策略**
-- 脱水 API 不可用 → 本地关键词提取 + 句子评分
+- 脱水 API 不可用 → 直接抛 RuntimeError（设计决策，详见 BEHAVIOR_SPEC.md 三、降级行为表）
 - 向量搜索不可用 → 纯 fuzzy match
 - 逐条错误隔离（grow 中单条失败不影响其他）
 
@@ -216,7 +216,7 @@
 | `server.py` | MCP 服务器主入口，注册工具 + Dashboard API + 钩子端点 | `bucket_manager`, `dehydrator`, `decay_engine`, `embedding_engine`, `utils` | `test_tools.py` |
 | `bucket_manager.py` | 记忆桶 CRUD、多维索引搜索、wikilink 注入、激活更新 | `utils` | `server.py`, `check_buckets.py`, `backfill_embeddings.py` |
 | `decay_engine.py` | 衰减引擎：遗忘曲线计算、自动归档、自动结案 | 无（接收 `bucket_mgr` 实例） | `server.py` |
-| `dehydrator.py` | 数据脱水压缩 + 合并 + 自动打标（LLM API + 本地降级） | `utils` | `server.py` |
+| `dehydrator.py` | 数据脱水压缩 + 合并 + 自动打标（仅 LLM API，不可用时报 RuntimeError） | `utils` | `server.py` |
 | `embedding_engine.py` | 向量化引擎：Gemini embedding API + SQLite + 余弦搜索 | `utils` | `server.py`, `backfill_embeddings.py` |
 | `utils.py` | 配置加载、日志、路径安全、ID 生成、token 估算 | 无 | 所有模块 |
 | `write_memory.py` | 手动写入记忆 CLI（绕过 MCP） | 无（独立脚本） | 无 |
@@ -389,12 +389,12 @@
 
 ### 5.4 为什么有 dehydration（脱水）这一层？
 
-**决策**：存入前先用 LLM 压缩内容（保留信息密度，去除冗余表达），API 不可用时降级到本地关键词提取。
+**决策**：存入前先用 LLM 压缩内容（保留信息密度，去除冗余表达）。API 不可用时直接抛出 `RuntimeError`，不静默降级。
 
 **理由**：
 - MCP 上下文有 token 限制，原始对话冗长，需要压缩
 - LLM 压缩能保留语义和情感色彩，纯截断会丢信息
-- 降级到本地确保离线可用——关键词提取 + 句子排序 + 截断
+- 本地关键词提取质量不足以替代语义打标与合并，静默降级会产生错误分类记忆，比报错更危险。详见 BEHAVIOR_SPEC.md 三、降级行为表。
 
 **放弃方案**：只做截断。信息损失太大。
 

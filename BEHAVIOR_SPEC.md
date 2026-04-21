@@ -508,7 +508,7 @@ Claude 决策: hold / grow / 自动
                     YAML frontmatter:
                       id, name, tags, domain, valence, arousal,
                       importance, type="dynamic", created, last_active,
-                      activation_count=1
+                      activation_count=0   # B-04: starts at 0; touch() bumps to 1+
                                │
                                ▼
           ┌─────── 记忆桶存活期 ──────────────────────────────────────┐
