@@ -2,6 +2,23 @@
 
 本项目版本号见根目录 `VERSION` 文件，Docker 镜像 tag 与之对应（`p0luz/ombre-brain:<VERSION>`）。
 
+## 2.4.0
+
+### 架构 / Architecture
+
+- 将当前高级架构线统一作为对外发布版本 `2.4.0`。
+- 保留内部 `src/ombrebrain/` 架构层命名：acceptance、eventsourcing、retrieval、microkernel、plugins、distributed 等模块继续作为内部深内核层存在。
+- 保持 MCP tool names、bucket markdown、Dashboard existing routes、config/env 语义不变。
+
+### 修复 / Fixed
+
+- 修复 `tests/test_permanent_breath_regression.py` 中写死 Windows 路径分隔符的断言，改为 `os.sep`，避免 Linux / Docker / CI 下出现跨平台假失败。
+
+### 维护 / Chores
+
+- VERSION + `src/VERSION` -> 2.4.0。
+- capability catalog 的 manifest version 改为读取项目版本，避免对外元数据继续暴露旧的架构草案版本号。
+
 ## 2.3.22
 
 ### 前端 / Frontend

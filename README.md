@@ -4,6 +4,8 @@
 
 A long-term emotional memory system for Claude (and any MCP client). Tags memories using Russell's valence/arousal coordinates, stores them as Obsidian-compatible Markdown, connects via MCP, with forgetting curve and vector semantic search.
 
+> **v2.4.0 noncommercial notice**: v2.4.0 architecture work is intended as source-available public code for personal, learning, research, and noncommercial self-hosting use. Commercial hosting, resale, renamed resale, SaaS resale, or selling modified v2.4.0 builds requires project-owner permission. See [LICENSE.v2.4.0-NONCOMMERCIAL-NOTICE.md](LICENSE.v2.4.0-NONCOMMERCIAL-NOTICE.md).
+
 > **开发者文档**：架构 / API / 配置细节请见 [docs/INTERNALS.md](docs/INTERNALS.md)。本 README 只关心『怎么把它跑起来用上』。
 >
 > **更新日志**：每个版本「修了什么」见 [CHANGELOG.md](CHANGELOG.md)。

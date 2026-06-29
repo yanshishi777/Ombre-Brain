@@ -1787,6 +1787,7 @@
   <div class="tab" data-tab="import"><span>导入</span><span class="tab-en">Import</span></div>
   <div class="tab" data-tab="logs"><span>日志</span><span class="tab-en">Logs</span></div>
   <div class="tab" data-tab="settings"><span>设置</span><span class="tab-en">Settings</span></div>
+  <div class="tab" data-tab="v3-debug"><span>2.4.0 Debug</span><span class="tab-en">Replay</span></div>
   <div class="tab-spacer"></div>
   <div class="tab" data-tab="about"><span>关于</span><span class="tab-en">About</span></div>
 </div>
@@ -2039,6 +2040,27 @@
 
 <!-- Settings Tab View -->
 <!-- ====== iter 1.7 §G: Plan tab — kanban-style list with status + change history ====== -->
+<div class="content" id="v3-debug-view" style="display:none">
+  <div style="display:grid;grid-template-columns:minmax(260px,360px) minmax(0,1fr);gap:16px;align-items:start;">
+    <div class="config-section" style="margin:0;">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;">
+        <h3 style="margin:0;">2.4.0 Debug</h3>
+        <button onclick="loadV3Debug()" title="Refresh" style="padding:7px 10px;display:inline-flex;align-items:center;gap:5px;"><i data-lucide="refresh-cw"></i></button>
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:12px;">
+        <input id="v3-debug-module" type="text" placeholder="module" style="min-width:0;flex:1;font-size:12px;padding:8px 10px;">
+        <input id="v3-debug-operation" type="text" placeholder="operation" style="min-width:0;flex:1;font-size:12px;padding:8px 10px;">
+      </div>
+      <div id="v3-debug-meta" style="font-size:12px;color:var(--text-dim);min-height:18px;margin-bottom:8px;"></div>
+      <div id="v3-debug-list" style="display:flex;flex-direction:column;gap:8px;max-height:58vh;overflow:auto;"></div>
+    </div>
+    <div class="config-section" style="margin:0;min-height:340px;">
+      <h3 style="margin-bottom:12px;">Replay</h3>
+      <div id="v3-debug-detail" style="font-size:12px;line-height:1.65;color:var(--text);"></div>
+    </div>
+  </div>
+</div>
+
 <div class="content" id="plan-view" style="display:none">
   <div style="max-width:920px;margin:0 auto;">
     <div class="config-section">
@@ -3774,6 +3796,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     document.getElementById('plan-view').style.display = target === 'plan' ? '' : 'none';
     document.getElementById('import-view').style.display = target === 'import' ? '' : 'none';
     document.getElementById('logs-view').style.display = target === 'logs' ? '' : 'none';
+    document.getElementById('v3-debug-view').style.display = target === 'v3-debug' ? '' : 'none';
     document.getElementById('settings-view').style.display = target === 'settings' ? '' : 'none';
     document.getElementById('letters-view').style.display = target === 'letters' ? '' : 'none';
     document.getElementById('anchors-view').style.display = target === 'anchors' ? '' : 'none';
@@ -3784,6 +3807,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     if (target === 'plan') loadPlans();
     if (target === 'import') { pollImportStatus(); loadImportResults(); }
     if (target === 'logs') { loadLogs(); loadOBErrors(); }
+    if (target === 'v3-debug') loadV3Debug();
     if (target === 'settings') {
       // 任务D：合并 config + settings 后，切换到「设置」时一次性加载所有面板数据
       loadSettingsStatus();
@@ -6709,6 +6733,86 @@ async function batchReview(idsJson, action) {
 // ========================================
 // iter 1.6 §3 — heartbeat indicator + log viewer
 // ========================================
+// v3-debug-panel
+let _v3DebugRecords = [];
+
+async function loadV3Debug() {
+  const list = document.getElementById('v3-debug-list');
+  const meta = document.getElementById('v3-debug-meta');
+  const detail = document.getElementById('v3-debug-detail');
+  if (!list || !meta || !detail) return;
+  list.innerHTML = '<div class="loading" style="padding:20px;">loading...</div>';
+  meta.textContent = '';
+  const moduleValue = (document.getElementById('v3-debug-module')?.value || '').trim();
+  const operationValue = (document.getElementById('v3-debug-operation')?.value || '').trim();
+  const params = new URLSearchParams({ limit: '30' });
+  if (moduleValue) params.set('module', moduleValue);
+  if (operationValue) params.set('operation', operationValue);
+  try {
+    const r = await authFetch('/api/v3/debug/decisions?' + params.toString());
+    if (!r) return;
+    const data = await readJsonSafe(r);
+    _v3DebugRecords = data.records || [];
+    meta.textContent = (_v3DebugRecords.length || 0) + ' records';
+    if (!_v3DebugRecords.length) {
+      list.innerHTML = '<div class="loading" style="padding:20px;">empty</div>';
+      detail.innerHTML = '';
+      return;
+    }
+    list.innerHTML = _v3DebugRecords.map(renderV3DebugDecision).join('');
+    await replayV3Decision(_v3DebugRecords[0].id);
+  } catch (e) {
+    list.innerHTML = '<div style="color:var(--negative);font-size:12px;">' + esc(e.message) + '</div>';
+  }
+}
+
+function renderV3DebugDecision(record, index) {
+  const summary = record.summary || {};
+  const ok = summary.consistency_ok && summary.outcome_ok;
+  const allowed = summary.policy_allowed;
+  const badgeColor = ok && allowed ? 'var(--positive)' : (allowed ? 'var(--warning)' : 'var(--negative)');
+  const surfaces = (summary.projection_surfaces || []).join(', ') || '-';
+  return '<button onclick="replayV3Decision(\\'' + esc(record.id) + '\\')" ' +
+    'style="text-align:left;background:var(--surface-solid);border:1px solid var(--border);border-radius:4px;padding:10px 12px;cursor:pointer;color:var(--text);">' +
+    '<div style="display:flex;align-items:center;gap:8px;font-size:12px;">' +
+      '<span style="width:7px;height:7px;border-radius:50%;background:' + badgeColor + ';display:inline-block;flex-shrink:0;"></span>' +
+      '<span style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(record.module || '-') + '.' + esc(record.operation || '-') + '</span>' +
+      '<span style="margin-left:auto;color:var(--text-light);font-size:11px;">#' + (index + 1) + '</span>' +
+    '</div>' +
+    '<div style="font-size:11px;color:var(--text-dim);margin-top:6px;word-break:break-all;">' + esc(record.command_id || '') + '</div>' +
+    '<div style="font-size:11px;color:var(--text-light);margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(surfaces) + '</div>' +
+  '</button>';
+}
+
+async function replayV3Decision(identifier) {
+  const detail = document.getElementById('v3-debug-detail');
+  if (!detail) return;
+  detail.innerHTML = '<div class="loading" style="padding:20px;">replay...</div>';
+  try {
+    const r = await authFetch('/api/v3/debug/replay/' + encodeURIComponent(identifier));
+    if (!r) return;
+    const data = await readJsonSafe(r);
+    const replay = data.replay || {};
+    const explanation = replay.explanation || {};
+    const issues = replay.issues || [];
+    detail.innerHTML =
+      '<div style="display:grid;grid-template-columns:130px 1fr;gap:8px 12px;font-size:12px;">' +
+        '<span style="color:var(--text-light);">decision</span><span style="word-break:break-all;">' + esc((data.record || {}).id || identifier) + '</span>' +
+        '<span style="color:var(--text-light);">module</span><span>' + esc(explanation.module || '-') + '.' + esc(explanation.operation || '-') + '</span>' +
+        '<span style="color:var(--text-light);">policy</span><span>' + String(explanation.policy_allowed) + '</span>' +
+        '<span style="color:var(--text-light);">consistency</span><span>' + String(explanation.consistency_ok) + '</span>' +
+        '<span style="color:var(--text-light);">replay</span><span>' + String(replay.ok) + '</span>' +
+        '<span style="color:var(--text-light);">surfaces</span><span style="word-break:break-all;">' + esc((explanation.projection_surfaces || []).join(', ') || '-') + '</span>' +
+      '</div>' +
+      '<pre style="margin-top:14px;background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:12px;white-space:pre-wrap;word-break:break-word;max-height:42vh;overflow:auto;font-size:11px;">' +
+      esc(JSON.stringify({ issues: issues, explanation: explanation }, null, 2)) +
+      '</pre>';
+  } catch (e) {
+    detail.innerHTML = '<div style="color:var(--negative);font-size:12px;">' + esc(e.message) + '</div>';
+  }
+}
+// v3-debug-panel-end
+
 async function pollHeartbeat() {
   const dot = document.getElementById('heartbeat-dot');
   const txt = document.getElementById('heartbeat-text');
