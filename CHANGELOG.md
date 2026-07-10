@@ -2,6 +2,26 @@
 
 本项目版本号见根目录 `VERSION` 文件，Docker 镜像 tag 与之对应（`p0luz/ombre-brain:<VERSION>`）。
 
+## 2.5.3
+
+### 修复 / Fixed
+
+- 统一解析带 `Z` / UTC offset 的时间字段，避免新导入记忆被误判为旧记忆并异常衰减。
+- 修正字符串 `"false"` 在 OAuth、embedding、记忆状态和 LLM 结构化结果中被误当作开启的问题。
+- 移除普通写入、导入和编辑路径的重复 embedding 请求，统一由 `BucketManager` 维护向量。
+- embedding 热重载会同步更新 Web、MCP、桶管理、导入和完整迁移运行时，避免新旧模型并存。
+- 同步两份 Dashboard，并修正 Docker 宿主机挂载提示和动态调试 ID 的安全传递。
+
+### 测试 / Tests
+
+- 新增时间、布尔边界、embedding 单次写入、热重载引用和 Dashboard 一致性回归测试。
+- 使用隔离的真实本地服务验证 Dashboard、12 个 MCP 工具、`hold` 落盘、`breath` 读回及 `pulse`。
+- 完整测试通过：623 passed，7 skipped。
+
+### 维护 / Chores
+
+- VERSION + `src/VERSION` -> 2.5.3。
+
 ## 2.5.2
 
 ### 修复 / Fixed
