@@ -8,10 +8,13 @@ from typing import Awaitable, Callable
 
 _Receive = Callable[[], Awaitable[dict]]
 _Send = Callable[[dict], Awaitable[None]]
+_REJECTION_DRAIN_MULTIPLIER = 2
 
 
 class _RequestBodyTooLarge(Exception):
-    pass
+    def __init__(self, *, request_ended: bool) -> None:
+        super().__init__("request body too large")
+        self.request_ended = request_ended
 
 
 class MCPRequestBodyLimitMiddleware:
@@ -43,6 +46,13 @@ class MCPRequestBodyLimitMiddleware:
                 await self._send_json(send, 400, "invalid Content-Length")
                 return
             if declared_length > self.max_bytes:
+                # Docker Desktop on Windows may reset the TCP connection when
+                # an ASGI app returns before a modest in-flight request body is
+                # consumed. Drain only a bounded amount, without parsing or
+                # retaining it, so normal oversized clients reliably see 413
+                # while very large/slow attacks are still rejected promptly.
+                if declared_length <= self.max_bytes * _REJECTION_DRAIN_MULTIPLIER:
+                    await self._drain_request(receive, max_bytes=declared_length)
                 await self._send_too_large(send)
                 return
 
@@ -55,7 +65,9 @@ class MCPRequestBodyLimitMiddleware:
             if message.get("type") == "http.request":
                 received += len(message.get("body", b""))
                 if received > self.max_bytes:
-                    raise _RequestBodyTooLarge
+                    raise _RequestBodyTooLarge(
+                        request_ended=not message.get("more_body", False)
+                    )
             return message
 
         async def tracked_send(message: dict) -> None:
@@ -66,10 +78,29 @@ class MCPRequestBodyLimitMiddleware:
 
         try:
             await self.app(scope, limited_receive, tracked_send)
-        except _RequestBodyTooLarge:
+        except _RequestBodyTooLarge as exc:
             if response_started:
                 raise
+            if not exc.request_ended:
+                await self._drain_request(receive, max_bytes=self.max_bytes)
             await self._send_too_large(send)
+
+    @staticmethod
+    async def _drain_request(receive: _Receive, *, max_bytes: int) -> bool:
+        """Discard at most ``max_bytes`` and report whether the request ended."""
+        drained = 0
+        while drained <= max(0, max_bytes):
+            message = await receive()
+            if not isinstance(message, dict):
+                return False
+            if message.get("type") == "http.disconnect":
+                return True
+            if message.get("type") != "http.request":
+                continue
+            drained += len(message.get("body", b""))
+            if not message.get("more_body", False):
+                return True
+        return False
 
     async def _send_too_large(self, send: _Send) -> None:
         await self._send_json(

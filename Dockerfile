@@ -38,11 +38,11 @@ RUN if [ "$INSTALL_CLOUDFLARED" = "1" ]; then \
 # 默认留空 → 官方 PyPI，行为不变。
 ARG PIP_INDEX_URL=""
 ARG PIP_TRUSTED_HOST=""
-COPY requirements.txt .
+COPY requirements.txt requirements.lock.txt ./
 RUN pip install --no-cache-dir --retries 10 --timeout 120 \
         ${PIP_INDEX_URL:+-i "$PIP_INDEX_URL"} \
         ${PIP_TRUSTED_HOST:+--trusted-host "$PIP_TRUSTED_HOST"} \
-        -r requirements.txt
+        --require-hashes -r requirements.lock.txt
 
 # Copy project files / 复制项目文件
 COPY src/ ./src/

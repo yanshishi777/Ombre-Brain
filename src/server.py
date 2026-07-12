@@ -46,7 +46,7 @@ from embedding_engine import EmbeddingEngine
 from embedding_outbox import EmbeddingOutbox
 from import_memory import ImportEngine
 from migrate_engine import MigrateEngine
-from utils import get_version, load_config, parse_bool, setup_logging
+from utils import get_version, load_config, setup_logging
 
 # --- iter 2.1：MCP 工具实现已按代码路径拆分到 tools/ 子包 ---
 # 本文件只保留 MCP 注册 + 路由（HTTP custom_route）+ 共享辅助。
@@ -143,8 +143,6 @@ _BIND_HOST = (os.environ.get("OMBRE_BIND_HOST") or "0.0.0.0").strip() or "0.0.0.
 
 # --- Webhook / HTTP 客户端超时 ---
 _WEBHOOK_TIMEOUT_SECONDS = 5.0
-_HEALTH_PROBE_TIMEOUT_SECONDS = 5
-_DEFAULT_MAX_MCP_REQUEST_BYTES = 4 * 1024 * 1024
 
 # --- Dashboard 鉴权 / 会话 / 密码 / 日志&错误面板分页常量 已移至 web/_shared.py、web/system.py ---
 
@@ -796,7 +794,7 @@ async def dream(window_hours: Optional[int] = 48) -> str:
 # OAuth 2.0 — MCP Remote Auth —— 已拆分到 web/oauth.py（路由在其 register 内注册）。
 # 这里仅把启动期 MCP 鉴权中间件要用的 _is_valid_mcp_token import 回来。
 # ============================================================
-from web.oauth import _is_valid_mcp_token  # noqa: F401  (used by _MCPAuthMiddleware below)
+from web.oauth import _is_valid_mcp_token  # noqa: F401  (injected into server_app middleware)
 
 
 # ============================================================
@@ -818,9 +816,15 @@ if __name__ == "__main__":
     # mcp_extra 仅作历史工具分组容器保留（7 个 @mcp_extra.tool() 注册不动），
     # 这里把它的工具回灌进 mcp，让 stdio / sse / streamable-http 三种 transport 一致。
     # 依赖 FastMCP._tool_manager 私有结构；若未来版本变化，降级为仅暴露主集 5 工具。
+    from server_app import (
+        HTTPRuntimeSettings,
+        RuntimeLifecycle,
+        build_http_app,
+        merge_mcp_tool_registries,
+    )
+
     try:
-        _extra_count = len(mcp_extra._tool_manager._tools)
-        mcp._tool_manager._tools.update(mcp_extra._tool_manager._tools)
+        _extra_count = merge_mcp_tool_registries(mcp, mcp_extra)
         logger.info(
             f"单连接器 /mcp：已把 {_extra_count} 个副集工具回灌进主实例，共 "
             f"{len(mcp._tool_manager._tools)} 个工具对外暴露"
@@ -831,231 +835,46 @@ if __name__ == "__main__":
         )
 
     if transport in ("sse", "streamable-http"):
-        import threading
         import uvicorn
-        from starlette.middleware.cors import CORSMiddleware
-        from web.request_limits import MCPRequestBodyLimitMiddleware
+        from web import ollama_local as _ollama_local
 
-        # --- Application-level keepalive: ping /health every 60s ---
-        # --- 应用层保活：每 60 秒 ping 一次 /health，防止 Cloudflare Tunnel 空闲断连 ---
-        # 用 127.0.0.1 而非 localhost：uvicorn 绑的是 0.0.0.0（仅 IPv4）。在 Proot / Termux
-        # 等环境里 localhost 常先解析到 IPv6 ::1，连不上 IPv4-only 的监听 → 保活每分钟报一次
-        # warning、日志噪声很大（且掩盖真正的连接问题）。显式走 127.0.0.1 稳定命中本机 IPv4。
-        async def _keepalive_loop() -> None:
-            await asyncio.sleep(10)  # Wait for server to fully start
-            async with httpx.AsyncClient() as client:
-                while True:
-                    try:
-                        await client.get(f"http://127.0.0.1:{OMBRE_PORT}/health", timeout=_HEALTH_PROBE_TIMEOUT_SECONDS)
-                        logger.debug("Keepalive ping OK / 保活 ping 成功")
-                    except Exception as e:
-                        logger.warning(f"Keepalive ping failed / 保活 ping 失败: {e}")
-                    await asyncio.sleep(60)
-
-        def _start_keepalive() -> None:
-            loop = asyncio.new_event_loop()
-            loop.run_until_complete(_keepalive_loop())
-
-        t = threading.Thread(target=_start_keepalive, daemon=True)
-        t.start()
-
-        # --- Add CORS middleware so remote clients (Cloudflare Tunnel / ngrok) can connect ---
-        # --- 添加 CORS 中间件，让远程客户端（Cloudflare Tunnel / ngrok）能正常连接 ---
+        _http_settings = HTTPRuntimeSettings.from_config(config)
+        _runtime_lifecycle = RuntimeLifecycle(
+            logger=logger,
+            decay_engine=decay_engine,
+            embedding_outbox=embedding_outbox,
+            ensure_ollama_child=_ollama_local.ensure_child_on_boot,
+            stop_ollama_child=_ollama_local.stop_child,
+            load_tunnel_config=_load_tunnel_config,
+            start_tunnel=_start_tunnel,
+            stop_tunnel=_stop_tunnel,
+            restart_github_auto_task=_restart_github_auto_task,
+            github_auto_interval=_gh_auto_interval,
+            boot_marker_path=os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                ".boot_fails",
+            ),
+            # Explicit IPv4 avoids localhost resolving to ::1 in Proot/Termux.
+            keepalive_url=f"http://127.0.0.1:{OMBRE_PORT}/health",
+        )
+        _app = build_http_app(
+            mcp,
+            transport,
+            settings=_http_settings,
+            token_validator=_is_valid_mcp_token,
+            lifecycle=_runtime_lifecycle,
+        )
         if transport == "streamable-http":
-            # iter 2.2：单连接器 /mcp。工具已在启动入口处统一回灌进 mcp 主实例，
-            # 这里只起主实例的 streamable_http_app()，对外暴露唯一一条 /mcp 路由
-            # + 所有 dashboard custom_route。不再起 mcp_extra 的 app（/mcp-extra 已废）。
-            import contextlib as _ctxlib
-            _app = mcp.streamable_http_app()
-            _main_lifespan = _app.router.lifespan_context
-
-            @_ctxlib.asynccontextmanager
-            async def _combined_lifespan(app):
-                async with _main_lifespan(app):
-                    # Auto-start tunnel if configured
-                    _tcfg = _load_tunnel_config()
-                    if _tcfg.get("auto_start") and _tcfg.get("token"):
-                        _ok, _msg = _start_tunnel(_tcfg["token"])
-                        logger.info(f"Tunnel auto-start: {_msg}")
-                    # Auto-start GitHub sync loop if configured
-                    if _gh_auto_interval > 0:
-                        _restart_github_auto_task(_gh_auto_interval)
-                    # Start decay engine at boot, not lazily on first MCP tool.
-                    # 之前 decay 只在 breath/hold/... 首次调用时 ensure_started()，于是：
-                    #   ① 纯用 dashboard、从不调 MCP 工具时，记忆永远不衰减；
-                    #   ② /api/status 在首个工具调用前读到 is_running=False 显示「stopped」，
-                    #      而 pulse 因为自己先 ensure_started() 显示「running」——两处自相矛盾。
-                    # 放到 lifespan 里启动后，引擎始终在跑，两处状态一致。
-                    try:
-                        await decay_engine.start()
-                    except Exception as _decay_exc:
-                        logger.warning(f"decay engine start at boot failed: {_decay_exc}")
-                    # 裸机 + 本地向量化时，把 ollama 作为 OB 子进程拉起（常驻）。
-                    # Docker / 云端向量化下是 no-op。
-                    try:
-                        from web import ollama_local as _ollama_local
-                        await _ollama_local.ensure_child_on_boot()
-                    except Exception as _ol_exc:
-                        logger.warning(f"ollama child boot failed: {_ol_exc}")
-                    try:
-                        await embedding_outbox.start()
-                    except Exception as _outbox_exc:
-                        logger.warning(f"embedding outbox start failed: {_outbox_exc}")
-                    # #4a ②：启动成功（app 已初始化、引擎已起、即将开始服务）→ 清零 entrypoint
-                    # 的崩溃计数 .boot_fails。崩在这之前（import/init）= 启动失败，计数保留，
-                    # 连续失败由 entrypoint 回滚到 _prev。只在「从持久卷 CODE_DIR 跑」时存在该文件。
-                    try:
-                        _bf = os.path.join(
-                            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".boot_fails"
-                        )
-                        if os.path.exists(_bf):
-                            with open(_bf, "w") as _bff:
-                                _bff.write("0")
-                            logger.info("boot ok → 已重置 .boot_fails（热更新自检通过）")
-                    except Exception as _bf_exc:
-                        logger.warning(f"reset .boot_fails failed: {_bf_exc}")
-                    yield
-                    try:
-                        await embedding_outbox.stop()
-                    except Exception:
-                        pass
-                    try:
-                        await decay_engine.stop()
-                    except Exception:
-                        pass
-                    try:
-                        from web import ollama_local as _ollama_local
-                        await _ollama_local.stop_child()
-                    except Exception:
-                        pass
-                    _stop_tunnel()
-
-            _app.router.lifespan_context = _combined_lifespan
             logger.info("MCP 单连接器 /mcp：12 个工具统一对外暴露")
-        else:
-            _app = mcp.sse_app()
-        _app.add_middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_methods=["*"],
-            allow_headers=["*"],
-            expose_headers=["*"],
-        )
         logger.info("CORS middleware enabled for remote transport / 已启用 CORS 中间件")
-
-        try:
-            _mcp_body_limit = int(
-                (config.get("limits") or {}).get(
-                    "max_mcp_request_bytes", _DEFAULT_MAX_MCP_REQUEST_BYTES
-                )
-            )
-        except (TypeError, ValueError, OverflowError):
-            _mcp_body_limit = _DEFAULT_MAX_MCP_REQUEST_BYTES
-        if _mcp_body_limit < 0:
-            _mcp_body_limit = _DEFAULT_MAX_MCP_REQUEST_BYTES
-        _app.add_middleware(
-            MCPRequestBodyLimitMiddleware,
-            max_bytes=_mcp_body_limit,
-        )
         logger.info(
             "MCP request body limit: %s",
-            "disabled" if _mcp_body_limit == 0 else f"{_mcp_body_limit} bytes",
+            "disabled"
+            if _http_settings.max_request_bytes == 0
+            else f"{_http_settings.max_request_bytes} bytes",
         )
 
-        # MCP Bearer token auth — pure ASGI middleware (no response buffering)
-        # BaseHTTPMiddleware buffers SSE streams and breaks MCP tool listing
-        import json as _json_mw
-
-        # config.yaml: mcp_require_auth: false → 完全跳过 OAuth 检查，
-        # 任何客户端（GPT / GLM / 自定义前端）可免认证直连 /mcp。
-        # 不填或 true → 保持默认：必须 OAuth Bearer token。
-        _mcp_auth_required = parse_bool(
-            config.get("mcp_require_auth", True), default=True
-        )
-
-        class _MCPAuthMiddleware:
-            def __init__(self, app):
-                self.app = app
-
-            async def __call__(self, scope, receive, send):
-                if scope["type"] == "http" and _mcp_auth_required:
-                    path = scope.get("path", "")
-                    if path.startswith("/mcp"):
-                        headers = {k.lower(): v for k, v in scope.get("headers", [])}
-                        auth = headers.get(b"authorization", b"").decode("latin-1")
-                        # Build the externally visible canonical resource. Proxy headers can
-                        # contain comma-separated chains; the first value is the client-facing one.
-                        proto = (
-                            headers.get(b"x-forwarded-proto", b"").decode().split(",", 1)[0].strip()
-                            or scope.get("scheme", "http")
-                        )
-                        host = (
-                            (headers.get(b"x-forwarded-host") or headers.get(b"host", b""))
-                            .decode().split(",", 1)[0].strip()
-                        )
-                        base = f"{proto}://{host}"
-                        resource = f"{base}{path.rstrip('/')}"
-                        if not (
-                            auth.startswith("Bearer ")
-                            and _is_valid_mcp_token(auth[7:], resource=resource)
-                        ):
-                            base = f"{proto}://{host}"
-                            # 让 resource_metadata 指向「本次请求 endpoint」对应的 metadata，
-                            # 使 metadata.resource 与实际连接的 /mcp 路径严格匹配（RFC 9728）。
-                            # 保留路径感知写法：对子路径请求也能返回匹配的 resource，避免被指回
-                            # 根 metadata 而匹配失败。
-                            endpoint = path.strip("/")
-                            meta_url = f"{base}/.well-known/oauth-protected-resource/{endpoint}"
-                            ww_auth = (
-                                f'Bearer realm="Ombre Brain",'
-                                f' resource_metadata="{meta_url}", scope="mcp"'
-                            )
-                            body = _json_mw.dumps({
-                                "error": "Unauthorized",
-                                "resource_metadata": meta_url,
-                            }).encode()
-                            await send({"type": "http.response.start", "status": 401, "headers": [
-                                [b"content-type", b"application/json"],
-                                [b"www-authenticate", ww_auth.encode()],
-                                [b"content-length", str(len(body)).encode()],
-                            ]})
-                            await send({"type": "http.response.body", "body": body, "more_body": False})
-                            return
-                await self.app(scope, receive, send)
-
-        class _MCPAcceptShim:
-            """补全 /mcp* 请求的 Accept 头，修复部分客户端的 406 Not Acceptable。
-
-            MCP SDK 的 streamable-http POST 严格要求 Accept 同时含 application/json
-            与 text/event-stream，否则 406。实测：某些客户端（含 Claude.ai 新加连接器）
-            发的首个探测 POST，Accept 有时缺 text/event-stream（或只有 */*）→ 直接 406，
-            且连接器校验不再重试。这里对 /mcp* 统一补齐缺失的两种类型
-            （仍走 SSE，不改响应模式），让 /mcp 对各种客户端的探测都稳定可连。"""
-            _NEED = (b"application/json", b"text/event-stream")
-
-            def __init__(self, app):
-                self.app = app
-
-            async def __call__(self, scope, receive, send):
-                if scope.get("type") == "http" and scope.get("path", "").startswith("/mcp"):
-                    headers = list(scope.get("headers", []))
-                    acc_i = next((i for i, (k, _v) in enumerate(headers) if k.lower() == b"accept"), -1)
-                    cur = headers[acc_i][1].lower() if acc_i >= 0 else b""
-                    miss = [t for t in self._NEED if t not in cur]
-                    if miss:
-                        if acc_i >= 0 and headers[acc_i][1].strip():
-                            new_val = headers[acc_i][1] + b", " + b", ".join(miss)
-                            headers[acc_i] = (headers[acc_i][0], new_val)
-                        elif acc_i >= 0:
-                            headers[acc_i] = (headers[acc_i][0], b", ".join(miss))
-                        else:
-                            headers.append((b"accept", b", ".join(miss)))
-                        scope = dict(scope)
-                        scope["headers"] = headers
-                await self.app(scope, receive, send)
-
-        _app.add_middleware(_MCPAcceptShim)
-        _app.add_middleware(_MCPAuthMiddleware)
+        _mcp_auth_required = _http_settings.auth_required
         if _mcp_auth_required:
             logger.info("MCP OAuth middleware enabled / MCP OAuth 中间件已启用")
         else:

@@ -13,6 +13,8 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      UV_VERSION: '0.11.23'
     steps:
       - uses: actions/checkout@v4
 
@@ -22,13 +24,40 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install lockfile tool
         run: |
-          pip install -r requirements.txt
-          pip install pytest pytest-asyncio pytest-cov pytest-timeout ruff
+          python -m pip install "uv==$UV_VERSION"
+
+      - name: Verify dependency lockfiles
+        run: |
+          uv pip compile requirements.txt --universal --python-version 3.12 --generate-hashes --output-file requirements.lock.txt
+          uv pip compile requirements-dev.in --universal --python-version 3.12 --generate-hashes --output-file requirements-dev.lock.txt
+          git diff --exit-code -- requirements.lock.txt requirements-dev.lock.txt
+
+      - name: Install locked dependencies
+        run: uv pip sync requirements-dev.lock.txt --require-hashes --system
 
       - name: Run static checks
         run: ruff check src tools deploy tests --no-cache
+
+      - name: Run security checks
+        run: |
+          bandit -r src tools deploy -ll -ii -q
+          pip-audit -r requirements.lock.txt
+
+      - name: Generate production dependency SBOM
+        run: >-
+          cyclonedx-py requirements requirements.lock.txt
+          --spec-version 1.6
+          --output-reproducible
+          --output-format JSON
+          --output-file sbom.cdx.json
+
+      - name: Upload dependency SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: ombre-brain-python-sbom
+          path: sbom.cdx.json
 
       - name: Run full local suite with coverage
         run: >-
@@ -77,6 +106,13 @@ jobs:
         run: >-
           python -m pytest tests/test_mcp_tools_docker_integration.py -q
           --timeout=60
+
+      - name: Run Docker Web management integration suite
+        env:
+          OMBRE_DOCKER_WEB_BASE_URL: http://127.0.0.1:18084
+        run: >-
+          python -m pytest tests/test_web_api_docker_integration.py -q
+          --timeout=120
 
       - name: Clean Docker MCP stack
         if: always()

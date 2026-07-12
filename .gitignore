@@ -61,3 +61,8 @@ ollama/
 
 # 本地设计预览稿（非应用文件）
 frontend/dashboard-preview.html
+
+# Rust shadow-kernel build output. ombre-kernel is currently a library crate,
+# so its generated Cargo.lock is not a release lockfile.
+kernel/rust/**/target/
+kernel/rust/ombre-kernel/Cargo.lock

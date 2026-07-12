@@ -395,11 +395,15 @@ cd Ombre-Brain
 
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.lock.txt
 
 cp config.example.yaml config.yaml
 python src/server.py
 ```
+
+`requirements.lock.txt` 是发布和普通安装使用的跨平台锁文件；`requirements.txt`
+保留直接依赖的最低版本约束，供维护者升级依赖时重新解析。这样同一版本的 OB
+不会因为安装日期不同而静默得到另一套传递依赖。
 
 ---
 
