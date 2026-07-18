@@ -44,7 +44,7 @@ from ombrebrain.retrieval import (
 )
 from ombrebrain.resilience.scanner import V3ResilienceScanner
 from ledger_mirror import LedgerMirror
-from ledger_property import LedgerReplayPropertyRunner
+from ombrebrain.eventsourcing.ledger_property import LedgerReplayPropertyRunner
 from ledger_replay import LedgerReplayValidator
 from projection_mirror import TraceCatalogProjection
 from projection_sqlite import TraceSQLiteProjection

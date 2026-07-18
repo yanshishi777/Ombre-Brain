@@ -124,3 +124,10 @@ def test_embedding_outbox_legacy_imports_are_canonical_objects():
 
     assert legacy.EmbeddingOutbox is embedding_outbox.EmbeddingOutbox
     assert legacy.content_hash is embedding_outbox.content_hash
+
+
+def test_ledger_property_legacy_import_is_the_canonical_class():
+    from ledger_property import LedgerReplayPropertyRunner as legacy_runner
+    from ombrebrain.eventsourcing.ledger_property import LedgerReplayPropertyRunner
+
+    assert legacy_runner is LedgerReplayPropertyRunner

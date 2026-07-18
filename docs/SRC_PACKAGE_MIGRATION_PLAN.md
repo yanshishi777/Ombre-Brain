@@ -55,6 +55,7 @@
 - [x] `backup_archive.py` → `ombrebrain/storage/backup_archive.py`（旧路径使用模块别名以保留 monkeypatch 语义）
 - [x] `embedding_outbox.py` → `ombrebrain/storage/embedding_outbox.py`
 - [ ] `projection_*` 与 `ledger_*`（每个文件仍单独迁移）
+  - [x] `ledger_property.py` → `ombrebrain/eventsourcing/ledger_property.py`
 
 ### 阶段 C：引擎与大型有状态模块
 
