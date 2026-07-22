@@ -318,42 +318,27 @@ gateway:
   # name to upstream.
   # 配置 upstreams 后，网关会聚合所有模型，并按模型名路由到对应上游。
   # models 可用字典写别名：id 是客户端看到的名字，upstream_model 是发给上游的真实名字。
-  # upstreams:
-  #   - name: "deepseek"
-  #     protocol: "openai"  # default; forwards to /chat/completions
-  #     base_url: "https://api.deepseek.com/v1"
-  #     api_key_env: "OMBRE_GATEWAY_DEEPSEEK_API_KEY"
-  #     # Optional fallback keys. Retryable errors switch to the next key.
-  #     # 可选备用 key。遇到可重试错误时自动换下一个 key。
-  #     # api_key_envs:
-  #     #   - "OMBRE_GATEWAY_DEEPSEEK_API_KEY_1"
-  #     #   - "OMBRE_GATEWAY_DEEPSEEK_API_KEY_2"
-  #     default_model: "deepseek-chat"
-  #     prompt_cache: ""  # DeepSeek uses automatic prefix cache / DeepSeek 使用自动前缀缓存
-  #     models:
-  #       - "deepseek-chat"
-  #       - "deepseek-reasoner"
-  #       - id: "deepseek-a/deepseek-v4"
-  #         upstream_model: "deepseek-v4"
-  #   - name: "siliconflow"
-  #     protocol: "openai"
-  #     base_url: "https://api.siliconflow.cn/v1"
-  #     api_key_env: "OMBRE_GATEWAY_SILICONFLOW_API_KEY"
-  #     models:
-  #       - "Qwen/Qwen3-32B"
-  #       - "THUDM/GLM-4-32B"
-  #   - name: "anthropic"
-  #     protocol: "anthropic"  # forwards /v1/messages to upstream /messages
-  #     base_url: "https://api.anthropic.com/v1"
-  #     api_key_env: "OMBRE_GATEWAY_ANTHROPIC_API_KEY"
-  #     anthropic_version: "2023-06-01"
-  #     prompt_cache: "anthropic_explicit"  # recommended for official Claude / most Anthropic-compatible proxies
-  #     # prompt_cache: "anthropic"  # compatibility mode for proxies that require top-level cache_control
-  #     # prompt_cache_retention: "1h"  # optional; default cache TTL is 5 minutes
-  #     default_model: "claude-sonnet"
-  #     models:
-  #       - id: "claude-sonnet"
-  #         upstream_model: "claude-sonnet-4-6"
+  upstreams:
+    - name: "deepseek"
+      protocol: "openai"
+      base_url: "https://api.deepseek.com/v1"
+      api_key_env: "OMBRE_GATEWAY_DEEPSEEK_API_KEY"
+      default_model: "deepseek-chat"
+      prompt_cache: ""
+      models:
+        - "deepseek-chat"
+        - "deepseek-reasoner"
+    - name: "zhongzhuan"
+      protocol: "openai"
+      base_url: "https://api.teamorouter.com/v1"
+      api_key_env: "OMBRE_GATEWAY_ZHONGZHUAN_API_KEY"
+      default_model: "claude-sonnet-4-6"
+      prompt_cache: ""
+      models:
+        - "claude-sonnet-4-6"
+        - "claude-sonnet-5"
+        - "claude-haiku-4-5"
+        - "claude-opus-4-6"
   head_recent_hours: 72
   recent_context_reentry_idle_hours: 24
   recent_context_cooldown_hours: 6
