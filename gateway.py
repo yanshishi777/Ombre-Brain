@@ -666,7 +666,7 @@ class GatewayService:
             1,
             min(8, int(self.gateway_cfg.get("diffusion_explore_multiplier", 3))),
         )
-        self.core_memory_interval_rounds = max(0, int(self.gateway_cfg.get("core_memory_interval_rounds", 0)))
+        self.core_memory_interval_rounds = max(1, int(self.gateway_cfg.get("core_memory_interval_rounds", 1)))
         self.word_map_hint_enabled = self._bool_config_value(
             self.gateway_cfg.get("word_map_hint_enabled"),
             False,
