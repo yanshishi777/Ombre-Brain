@@ -3283,6 +3283,343 @@ async def breath_hook(request):
 
 
 # =============================================================
+# /api/buckets/raw endpoint: 返回所有桶列表 JSON，供 gateway remote 读取
+# 解决 gateway 与 ombre-brain 存储隔离导致 core_memory 注入读不到 pinned 桶的问题
+# 注意：路径特意用 /api/buckets/raw 而非 /api/buckets，避免与下方 Dashboard 用
+#       的 /api/buckets（返回纯数组、带 dashboard 鉴权）路由冲突导致前端崩溃。
+# =============================================================
+@mcp.custom_route("/api/buckets/raw", methods=["GET"])
+async def api_buckets_raw(request):
+    import json as _json
+    from starlette.responses import Response
+    try:
+        include_archive = str(request.query_params.get("include_archive") or "").lower() in {"1", "true", "yes"}
+        buckets = await bucket_mgr.list_all(include_archive=include_archive)
+        body = _json.dumps({"buckets": buckets, "count": len(buckets)}, default=str, ensure_ascii=False)
+        return Response(body, media_type="application/json")
+    except Exception as e:
+        return Response(_json.dumps({"error": str(e)}), media_type="application/json", status_code=500)
+
+
+# =============================================================
+# /api/proactive-recall endpoint: 主动浮现检索
+# gateway 攒够用户消息后调用：只接收最近用户消息文本，返回高相关记忆摘要。
+# 记忆库不出 brain；候选池仅含 metadata.proactive_eligible=True 的桶。
+# =============================================================
+@mcp.custom_route("/api/proactive-recall", methods=["POST"])
+async def api_proactive_recall(request):
+    import json as _json
+    from starlette.responses import JSONResponse
+
+    try:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        recent_messages = body.get("recent_messages") or []
+        if not isinstance(recent_messages, list):
+            recent_messages = []
+        recent_messages = [str(m) for m in recent_messages if str(m).strip()][-8:]
+        if not recent_messages:
+            return JSONResponse({"status": "ok", "hits": []})
+
+        # 配置从 gateway 段读取（与 gateway 共用同一 config 源）
+        _gw_cfg = config.get("gateway", {}) or {}
+        _pc_cfg = _gw_cfg.get("proactive_recall", {}) or {}
+        similarity_threshold = float(_pc_cfg.get("similarity_threshold", 0.48))
+        score_threshold = float(_pc_cfg.get("score_threshold", 9))
+        cooldown_hours = float(_pc_cfg.get("cooldown_hours", 4))
+        max_candidates = max(1, int(_pc_cfg.get("max_candidates", 30)))
+        max_results = max(1, int(_pc_cfg.get("max_results", 3)))
+
+        topic = "\n".join(recent_messages)
+
+        # 1) 候选池：仅 proactive_eligible=True 的桶
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        eligible = [
+            b for b in all_buckets
+            if isinstance(b, dict) and (b.get("metadata") or {}).get("proactive_eligible") is True
+        ]
+        if not eligible:
+            return JSONResponse({"status": "ok", "hits": []})
+
+        # 2) 粗筛：向量相似度 > 阈值
+        candidates = []
+        if getattr(embedding_engine, "enabled", False):
+            try:
+                sim_results = await embedding_engine.search_similar(topic, top_k=max_candidates)
+                eligible_ids = {b["id"] for b in eligible if b.get("id")}
+                for bucket_id, sim in sim_results:
+                    if bucket_id in eligible_ids and sim >= similarity_threshold:
+                        candidates.append((str(bucket_id), float(sim)))
+            except Exception as e:
+                logger.warning("proactive recall embedding search failed: %s", e)
+        # 退化路径：embedding 不可用 / 该批桶无向量时，用关键词检索兜底（仍过 LLM 精筛）
+        if not candidates:
+            try:
+                kw = await bucket_mgr.search(topic, limit=max_candidates)
+                eligible_ids = {b["id"] for b in eligible if b.get("id")}
+                for b in kw:
+                    bid = b.get("id")
+                    if bid in eligible_ids:
+                        candidates.append((str(bid), 0.0))
+            except Exception as e:
+                logger.warning("proactive recall keyword fallback failed: %s", e)
+        if not candidates:
+            return JSONResponse({"status": "ok", "hits": []})
+
+        # 3) LLM 相关度打分（0-10），>= threshold 才保留
+        id_to_bucket = {b["id"]: b for b in eligible if b.get("id")}
+        scored = await _proactive_llm_score(topic, candidates, id_to_bucket, score_threshold)
+        if not scored:
+            return JSONResponse({"status": "ok", "hits": []})
+
+        # 4) 冷却 + 标记 surfaced
+        now = datetime.now(timezone.utc)
+        hits = []
+        for bucket_id, sim, llm_score, reason in scored[:max_results]:
+            b = id_to_bucket.get(bucket_id)
+            if not b:
+                continue
+            meta = b.get("metadata") or {}
+            last = meta.get("last_surfaced_at")
+            if last:
+                try:
+                    last_dt = datetime.fromisoformat(str(last))
+                    if last_dt.tzinfo is None:
+                        last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    if (now - last_dt).total_seconds() < cooldown_hours * 3600:
+                        continue
+                except Exception:
+                    pass
+            try:
+                await bucket_mgr.update(
+                    bucket_id,
+                    extra_metadata={"last_surfaced_at": now.isoformat(timespec="seconds")},
+                )
+            except Exception as e:
+                logger.warning("proactive update last_surfaced_at failed: %s", e)
+            content = (b.get("content") or "").strip()
+            if len(content) > 400:
+                content = content[:400] + "…"
+            hits.append({
+                "bucket_id": bucket_id,
+                "name": meta.get("name", bucket_id),
+                "content": content,
+                "similarity": round(sim, 4),
+                # path 字段用于区分召回来源：embedding=语义向量主路径，keyword=关键词退化兜底
+                "path": "embedding" if sim > 0 else "keyword",
+                "score": round(llm_score, 2),
+                "reason": reason or "",
+            })
+        return JSONResponse({"status": "ok", "hits": hits})
+    except Exception as e:
+        logger.warning("proactive-recall failed: %s", e)
+        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+
+
+# =============================================================
+# /api/admin/embedding-debug: 诊断用，暴露 search_similar 原始结果
+# 仅 dashboard 鉴权可调用。
+# =============================================================
+@mcp.custom_route("/api/admin/embedding-debug", methods=["POST"])
+async def api_admin_embedding_debug(request):
+    from starlette.responses import JSONResponse
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    topic = str(body.get("topic", ""))
+    top_k = max(1, int(body.get("top_k", 15)))
+    try:
+        sims = await embedding_engine.search_similar(topic, top_k=top_k)
+    except Exception as e:  # noqa: BLE001
+        sims = [("ERR:" + str(e), 0.0)]
+    all_buckets = await bucket_mgr.list_all(include_archive=False)
+    eligible = [
+        b["id"] for b in all_buckets
+        if isinstance(b, dict) and (b.get("metadata") or {}).get("proactive_eligible") is True
+    ]
+    # 完整复现 recall 的候选 + LLM 打分流程，便于诊断 0 hits
+    similarity_threshold = 0.48
+    eligible_ids = set(eligible)
+    # 用已算好的 sims（与 top_sims 同源），避免二次 search_similar 偶发差异
+    sims_in_eligible = []
+    for bid, sim in sims:
+        in_elig = bid in eligible_ids
+        if in_elig:
+            sims_in_eligible.append({
+                "bucket_id": bid,
+                "sim": round(sim, 4),
+                "pass_threshold": sim >= similarity_threshold,
+            })
+    candidates = []
+    for bid, sim in sims:
+        if bid in eligible_ids and sim >= similarity_threshold:
+            candidates.append((str(bid), float(sim)))
+    if not candidates:
+        try:
+            kw = await bucket_mgr.search(topic, limit=top_k)
+            for b in kw:
+                bid = b.get("id")
+                if bid in eligible_ids:
+                    candidates.append((str(bid), 0.0))
+        except Exception as e:  # noqa: BLE001
+            candidates = [("KW_ERR:" + str(e), 0.0)]
+    id_to_bucket = {b["id"]: b for b in all_buckets if b.get("id")}
+    scored = []
+    try:
+        scored = await _proactive_llm_score(topic, candidates, id_to_bucket, 9)
+    except Exception as e:  # noqa: BLE001
+        scored = [("SCORE_ERR:" + str(e), 0.0, 0.0, "")]
+    return JSONResponse({
+        "topic": topic,
+        "enabled": getattr(embedding_engine, "enabled", False),
+        "model": getattr(embedding_engine, "model", None),
+        "eligible_count": len(eligible),
+        "eligible": eligible,
+        "eligible_ids": list(eligible_ids),
+        "top_sims": [{"bucket_id": bid, "similarity": round(s, 4)} for bid, s in sims],
+        "sims_in_eligible": sims_in_eligible,
+        "candidates": [{"bucket_id": bid, "sim": round(s, 4)} for bid, s in candidates],
+        "dehy_client_ok": bool(getattr(dehydrator, "client", None)),
+        "scored": [
+            {"bucket_id": bid, "sim": round(s, 4), "score": round(sc, 2), "reason": r}
+            for bid, s, sc, r in scored
+        ],
+    })
+
+
+# =============================================================
+# /api/admin/backfill-embeddings: 服务端批量补 embedding
+# railway 无 exec，无法在容器内直接跑 backfill_embeddings.py；
+# 此接口在 brain 进程内运行（能访问卷上的 buckets_dir/embeddings.db）。
+# 仅 dashboard 鉴权可调用。
+# =============================================================
+_backfill_job = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "total": 0,
+    "done": 0,
+    "success": 0,
+    "failed": 0,
+    "skipped": 0,
+    "errors": [],
+}
+
+
+@mcp.custom_route("/api/admin/backfill-embeddings", methods=["POST"])
+async def api_admin_backfill_embeddings(request):
+    from starlette.responses import JSONResponse
+
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    if _backfill_job["running"]:
+        return JSONResponse({"error": "already running", "job": _backfill_job}, status_code=409)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    refresh_all = bool(body.get("refresh_all", False))
+    batch_size = max(1, int(body.get("batch_size", 25)))
+    asyncio.get_running_loop().create_task(_run_backfill_embeddings(refresh_all, batch_size))
+    return JSONResponse({"status": "started", "refresh_all": refresh_all, "batch_size": batch_size})
+
+
+async def _run_backfill_embeddings(refresh_all: bool, batch_size: int):
+    global _backfill_job
+    _backfill_job = {
+        "running": True,
+        "started_at": now_iso(),
+        "finished_at": None,
+        "total": 0,
+        "done": 0,
+        "success": 0,
+        "failed": 0,
+        "skipped": 0,
+        "errors": [],
+    }
+    try:
+        if not getattr(embedding_engine, "enabled", False):
+            _backfill_job["errors"].append("embedding engine not enabled (missing API key?)")
+            return
+        all_buckets = await bucket_mgr.list_all(include_archive=True)
+        _backfill_job["total"] = len(all_buckets)
+        for b in all_buckets:
+            bid = b.get("id")
+            if not bid:
+                _backfill_job["done"] += 1
+                _backfill_job["skipped"] += 1
+                continue
+            if not refresh_all:
+                existing = await embedding_engine.get_embedding(bid)
+                if existing:
+                    _backfill_job["done"] += 1
+                    _backfill_job["skipped"] += 1
+                    continue
+            text = bucket_text_for_embedding(b)
+            if not text or not text.strip():
+                _backfill_job["done"] += 1
+                _backfill_job["skipped"] += 1
+                continue
+            # 直接调用底层方法以捕获真实异常（generate_and_store 会吞掉异常）
+            ok = False
+            err_msg = ""
+            for _attempt in range(2):
+                try:
+                    emb = await embedding_engine._generate_embedding(text, kind="document")
+                    if emb:
+                        embedding_engine._store_embedding(bid, emb)
+                        ok = True
+                        break
+                    else:
+                        err_msg = f"{bid}: _generate_embedding returned empty (API error swallowed)"
+                except Exception as e:  # noqa: BLE001
+                    err_msg = f"{bid}: {type(e).__name__}: {e}"
+                await asyncio.sleep(1.0)
+            if ok:
+                _backfill_job["success"] += 1
+            else:
+                _backfill_job["failed"] += 1
+                _backfill_job["errors"].append(err_msg)
+            _backfill_job["done"] += 1
+    except Exception as e:  # noqa: BLE001
+        _backfill_job["errors"].append(f"fatal: {e}")
+    finally:
+        _backfill_job["running"] = False
+        _backfill_job["finished_at"] = now_iso()
+
+
+@mcp.custom_route("/api/admin/backfill-embeddings/status", methods=["GET"])
+async def api_admin_backfill_status(request):
+    from starlette.responses import JSONResponse
+
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    job = dict(_backfill_job)
+    job["engine"] = {
+        "enabled": getattr(embedding_engine, "enabled", False),
+        "model": getattr(embedding_engine, "model", None),
+        "base_url": getattr(embedding_engine, "base_url", None),
+        "api_key_prefix": (getattr(embedding_engine, "api_key", "") or "")[:8],
+        "max_chars": getattr(embedding_engine, "max_chars", None),
+    }
+    return JSONResponse(job)
+
+
+# =============================================================
 # /introspection-hook endpoint: Dedicated hook for waking self-reflection
 # 清醒自省专用挂载点。/dream-hook 暂时保留兼容旧接入。
 # =============================================================
@@ -6022,6 +6359,100 @@ def _query_requires_direct_topic_evidence(query: str) -> bool:
 
 def _recall_rank(query: str, moment: dict) -> tuple[int, float]:
     return recall_rank(query, moment, _recall_relevance_options())
+
+
+def _extract_json_array(text: str) -> list:
+    """从模型输出里尽可能稳妥地抽出 JSON 数组。"""
+    import json as _json
+    if not text:
+        return []
+    s = text.strip()
+    start = s.find("[")
+    end = s.rfind("]")
+    if start >= 0 and end > start:
+        try:
+            return _json.loads(s[start:end + 1])
+        except Exception:
+            pass
+    return []
+
+
+async def _proactive_llm_score(
+    topic: str,
+    candidates: list[tuple[str, float]],
+    id_to_bucket: dict,
+    score_threshold: float,
+) -> list[tuple[str, float, float, str]]:
+    """用 LLM 对候选记忆打 0-10 相关度分，仅返回 >= threshold 的 (bucket_id, sim, score, reason)。
+
+    LLM 不可用时降级为相似度 >= 0.6 视为高相关。
+    """
+    cand_text = []
+    for i, (bid, _sim) in enumerate(candidates):
+        b = id_to_bucket.get(bid)
+        if not b:
+            continue
+        meta = b.get("metadata") or {}
+        content = (b.get("content") or "").strip()
+        if len(content) > 300:
+            content = content[:300] + "…"
+        cand_text.append(
+            f"[{i + 1}] id={bid} 名称={meta.get('name', '')}\n内容：{content}"
+        )
+    if not cand_text:
+        return []
+    prompt = (
+        "你是一个长期记忆相关性评分器。下面是一段当前对话（最近的用户消息）和若干候选记忆。\n"
+        "请判断每条候选记忆与当前对话话题的相关程度，给出 0-10 的整数分"
+        "（10=高度相关、此刻由 AI 主动提起很自然；0=无关、提起会突兀）。\n"
+        f"只保留真正高度相关（>= {int(score_threshold)} 分）的记忆，门槛要高，避免硬凑回忆。\n\n"
+        "当前对话（最近用户消息）：\n"
+        f"{topic}\n\n"
+        "候选记忆：\n"
+        f"{chr(10).join(cand_text)}\n\n"
+        "请只输出一个 JSON 数组，元素格式：{\"idx\": 序号, \"score\": 分数, \"reason\": \"一句话理由\"}。"
+        "不要输出任何其他内容。"
+    )
+    try:
+        if not getattr(dehydrator, "client", None):
+            raise RuntimeError("dehydrator client unavailable")
+        resp = await dehydrator.client.chat.completions.create(
+            model=dehydrator.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=1024,
+        )
+        text = ""
+        try:
+            text = resp.choices[0].message.content or ""
+        except Exception:
+            text = ""
+        arr = _extract_json_array(text)
+        scored: list[tuple[str, float, float, str]] = []
+        for item in arr:
+            if not isinstance(item, dict):
+                continue
+            idx = int(item.get("idx", 0)) - 1
+            try:
+                score = float(item.get("score", 0))
+            except (TypeError, ValueError):
+                score = 0.0
+            reason = str(item.get("reason", ""))
+            if 0 <= idx < len(candidates) and score >= score_threshold:
+                bid, sim = candidates[idx]
+                scored.append((bid, sim, score, reason))
+        scored.sort(key=lambda x: x[2], reverse=True)
+        return scored
+    except Exception as e:
+        logger.warning("proactive LLM scoring failed, fallback to similarity: %s", e)
+        kept = []
+        for bid, sim in candidates:
+            if sim >= 0.6:
+                kept.append((bid, sim, sim * 10, "fallback"))
+            else:
+                # 关键词退化路径下 sim 为 0.0，信任粗筛 + 下方冷却，保留候选
+                kept.append((bid, sim, 10.0, "fallback"))
+        return kept
 
 
 async def _build_recall_debug_payload(
@@ -10911,9 +11342,11 @@ async def api_bucket_update(request):
     content = str(body.get("content") or "").strip() if "content" in body else None
     name = str(body.get("name") or "").strip() if "name" in body else None
     event_date = str(body.get("date") or "").strip() if "date" in body else None
+    proactive_eligible = body.get("proactive_eligible") if "proactive_eligible" in body else None
+    clear_cooldown = bool(body.get("clear_cooldown", False))
 
-    if content is None and name is None and event_date is None:
-        return JSONResponse({"error": "missing content, name, or date"}, status_code=400)
+    if content is None and name is None and event_date is None and proactive_eligible is None and not clear_cooldown:
+        return JSONResponse({"error": "missing content, name, date, proactive_eligible, or clear_cooldown"}, status_code=400)
     if event_date:
         normalized_date = local_date_key(event_date)
         if not normalized_date:
@@ -10938,6 +11371,14 @@ async def api_bucket_update(request):
         update_kwargs["name"] = name or None
     if event_date is not None:
         update_kwargs["date"] = event_date
+    if proactive_eligible is not None:
+        extra = update_kwargs.get("extra_metadata") or {}
+        extra["proactive_eligible"] = bool(proactive_eligible)
+        update_kwargs["extra_metadata"] = extra
+    if clear_cooldown:
+        extra = update_kwargs.get("extra_metadata") or {}
+        extra["last_surfaced_at"] = ""
+        update_kwargs["extra_metadata"] = extra
     update_kwargs["last_active"] = meta.get("last_active") or meta.get("created")
 
     before_bucket = bucket
