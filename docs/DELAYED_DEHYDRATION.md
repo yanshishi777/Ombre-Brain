@@ -74,6 +74,12 @@
 
 参数：`--dry-run`（默认，只列不写） / `--write` / `--freshness-days N` / `--limit K` / `--loop` / `--interval-minutes M`。
 
+> **实际上线采用「进程内常驻循环」**（而非独立 worker 进程）：在 `server.py` 的 sse 启动块里启一个 daemon 线程循环（沿用 reflection/dream 同一定式），周期调用 `run_delayed_dehydration(dry_run=False, limit=50)`。这样与 brain 共享同一 `bucket_mgr` 与数据，避免跨服务文件系统不一致。
+> 配置项：
+> - `delayed_dehydration_loop`（默认 true；env `OMBRE_DD_LOOP=0`/`false`/`no`/`off` 可关闭）
+> - `delayed_dehydration_loop_minutes`（默认 60；env `OMBRE_DD_LOOP_MINUTES` 覆盖）
+> 独立 `scripts/delayed_dehydration_worker.py` 仍可用（本地调试或单独部署），但生产环境走进程内循环。
+
 ## 7. HTTP 端点
 
 `POST /api/delayed-dehydrate`
@@ -89,10 +95,11 @@
 - **实际上线方式**：`railway up --service ombre-brain --environment production --yes`
   （railway CLI 5.28.0，路径 `/c/Users/91543/.workbuddy/binaries/node/workspace/node_modules/.bin/railway`，
   登录态 915439839@qq.com 有效；部署前加 `.railwayignore` 排除 `CREDENTIALS.md`/`buckets`/`fix_address.py`）。
-  该命令把"本地目录"直传部署，覆盖当前运行实例（deployment ID `2144c5ff-...`）。
+  该命令把"本地目录"直传部署，覆盖当前运行实例（最新部署 ID `10598d8e-16ff-4ead-9ee2-cbe4010e787e`，transport 为 `streamable-http`）。
   ⚠️ 注意：`railway up` 是本地直传，会**脱离 GitHub 自动部署**；若以后想恢复"push 即部署"，
   可在 Railway 后台把该 service 的源分支设为 `feat/delayed-dehydration`（仓库已是 yanshishi777，无需重新授权）。
 - **本地运行（调试用）**：`OMBRE_TRANSPORT=sse python server.py`（需配 `OMBRE_API_KEY` / `OMBRE_BASE_URL` 才能实际脱水）。
+- **常驻循环已启用（生产）**：`server.py` sse 启动即拉起延迟脱水 daemon 线程循环（日志见 `Delayed dehydration scheduler enabled`），每 60 分钟把超期 `fresh` 桶固化脱水；无需额外 cron / worker 进程。
 
 ## 8.1 关于存量 188 个历史桶的行为（重要）
 
@@ -114,9 +121,11 @@
   - 超期 fresh（worker 尚未处理）→ 回退实时脱水（沙箱无 `OMBRE_API_KEY` 故抛"API 不可用"，属预期兜底路径正确接线）✅
 
 ### 9.2 生产环境（Railway，部署后实测）
-- 新部署 `2144c5ff-...` 上线，`GET /health` 返回 200。
+- 新部署 `10598d8e-...`（transport `streamable-http`）上线，`GET /health` 返回 200。
+- Railway 日志确认常驻循环启动：`Ombre Brain starting | transport: streamable-http` → `Delayed dehydration scheduler enabled / 延迟脱水定时器已启用` → `Application startup complete`。
 - `POST /api/delayed-dehydrate` dry-run 返回 200，扫到**真实生产数据 188 个 dynamic 桶**：
   `{"freshness_days": 7, "scanned": 188, "due": 0, "processed": [], "dry_run": true}`。
   - `scanned=188` 证明端点已对接真实桶数据；
-  - `due=0` 因为 188 个均为存量历史桶（`dehydration_state=null`，非 `fresh`），按设计跳过，符合预期。
+  - `due=0` 因为 188 个均为存量历史桶（`dehydration_state=null`，非 `fresh`），按设计跳过，常驻循环当前暂无事可做，符合预期。
+- 本地另做了**写路径端到端测试**（mock 脱水 API）：超期 fresh 桶经 `run_delayed_dehydration(dry_run=False)` 后 `dehydration_state` 变为 `dehydrated`、`content` 为摘要、`raw_content` 保留原文、`dehydrated_at` 已写，验证通过。
 - 召回注入层 `_recall_render_content` 与端点同属已部署的 `server.py`，逻辑已在 9.1 验证一致。
