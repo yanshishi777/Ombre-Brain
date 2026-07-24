@@ -3239,14 +3239,14 @@ async def breath_hook(request):
         parts = []
         token_budget = 10000
         for b in pinned:
-            summary = await dehydrator.dehydrate(_bucket_text_for_embedding(b), {k: v for k, v in b["metadata"].items() if k != "tags"})
+            summary = await _recall_render_content(b)
             parts.append(f"📌 [核心准则] {summary}")
             token_budget -= count_tokens_approx(summary)
 
         for b in anchors:
             if token_budget <= 0:
                 break
-            summary = await dehydrator.dehydrate(_bucket_text_for_embedding(b), {k: v for k, v in b["metadata"].items() if k != "tags"})
+            summary = await _recall_render_content(b)
             entry = f"⚓ [长期锚点] [bucket_id:{b['id']}] {summary}"
             entry_tokens = count_tokens_approx(entry)
             if entry_tokens > token_budget:
@@ -3267,7 +3267,7 @@ async def breath_hook(request):
         for b in candidates:
             if token_budget <= 0:
                 break
-            summary = await dehydrator.dehydrate(_bucket_text_for_embedding(b), {k: v for k, v in b["metadata"].items() if k != "tags"})
+            summary = await _recall_render_content(b)
             summary_tokens = count_tokens_approx(summary)
             if summary_tokens > token_budget:
                 break
@@ -3669,6 +3669,138 @@ def _bucket_days_since_last_active(meta: dict) -> float:
         return 9999.0
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     return max(0.0, (now - parsed).total_seconds() / 86400)
+
+
+# --- Delayed dehydration: recall-time freshness-aware rendering ---
+# --- 延迟脱水：召回时按保鲜状态决定原文/摘要 ---
+# 保鲜期内的 dynamic 记忆返回原文（截断到 RAW_RECALL_CHAR_CAP），保留近期细节；
+# 已被 worker 脱水的记忆返回已存摘要；其余实时脱水（原行为）。
+RAW_RECALL_CHAR_CAP = 1500
+
+
+async def _recall_render_content(bucket: dict) -> str:
+    """Recall 渲染：根据延迟脱水状态返回原文或摘要。
+
+    - state == "dehydrated"：worker 已把 content 写成摘要，直接格式化返回（不重复调 API）。
+    - state == "fresh" 且距上次激活 <= 保鲜窗口：返回原文（截断），保留近期细节与情感浓度。
+    - 其余（fresh 超期待处理 / 历史桶无 state）：实时脱水，保持原有行为，向后兼容。
+    """
+    meta = bucket.get("metadata", {}) or {}
+    state = meta.get("dehydration_state")
+    freshness_days = int(config.get("dehydrated_freshness_days", 7) or 7)
+    if state == "dehydrated":
+        return dehydrator._format_output(bucket.get("content", ""), meta)
+    days = _bucket_days_since_last_active(meta)
+    if state == "fresh" and days <= freshness_days:
+        raw = meta.get("raw_content") or bucket.get("content", "")
+        return dehydrator._format_output(_clip_text(raw, RAW_RECALL_CHAR_CAP), meta)
+    clean_meta = {k: v for k, v in meta.items() if k != "tags"}
+    return await dehydrator.dehydrate(_bucket_text_for_embedding(bucket), clean_meta)
+
+
+async def run_delayed_dehydration(
+    *,
+    dry_run: bool = True,
+    freshness_days: int | None = None,
+    limit: int = 50,
+) -> dict:
+    """延迟脱水扫描：把超过保鲜窗口的 fresh 桶脱水为摘要并固化。
+
+    只处理 dynamic、非钉选/保护、dehydration_state=="fresh" 且距上次激活 > N 天的桶；
+    历史桶（无 state）保持原实时脱水行为，不被批量改动（避免一次性大改 + 大量 API 调用）。
+    脱水后写入：content=摘要、raw_content=原文备份、dehydration_state="dehydrated"、dehydrated_at。
+    """
+    from utils import now_iso
+
+    freshness = int(
+        freshness_days
+        if freshness_days and freshness_days > 0
+        else config.get("dehydrated_freshness_days", 7) or 7
+    )
+    all_buckets = await bucket_mgr.list_all(include_archive=False)
+    due = []
+    for b in all_buckets:
+        meta = b.get("metadata", {}) or {}
+        if meta.get("type") != "dynamic":
+            continue
+        if meta.get("pinned") or meta.get("protected"):
+            continue
+        if meta.get("dehydration_state") != "fresh":
+            continue
+        days = _bucket_days_since_last_active(meta)
+        if days > freshness:
+            due.append(b)
+    due = due[: max(1, int(limit))]
+    processed = []
+    for b in due:
+        content = b.get("content", "")
+        meta = b.get("metadata", {}) or {}
+        if not content or not content.strip():
+            continue
+        bucket_id = b["id"]
+        if dry_run:
+            processed.append({"id": bucket_id, "status": "dry_run", "orig_len": len(content)})
+            continue
+        try:
+            summary = await dehydrator.dehydrate(
+                content, {k: v for k, v in meta.items() if k != "tags"}
+            )
+        except Exception as e:
+            processed.append({"id": bucket_id, "status": "dehydrate_failed", "error": str(e)})
+            continue
+        await bucket_mgr.update(
+            bucket_id,
+            content=summary,
+            raw_content=content,
+            dehydration_state="dehydrated",
+            dehydrated_at=now_iso(),
+        )
+        processed.append(
+            {"id": bucket_id, "status": "dehydrated", "orig_len": len(content), "summary_len": len(summary)}
+        )
+    return {
+        "freshness_days": freshness,
+        "scanned": len(all_buckets),
+        "due": len(due),
+        "processed": processed,
+        "dry_run": dry_run,
+    }
+
+
+@mcp.custom_route("/api/delayed-dehydrate", methods=["POST"])
+async def api_delayed_dehydrate(request):
+    """触发延迟脱水扫描。可被 Railway cron 部署或外部调度器（如 WorkBuddy 定时任务）调用。
+
+    可选 Bearer 保护：若设置了 OMBRE_DEHYDRATION_TOKEN 或 OMBRE_GATEWAY_TOKEN，
+    则请求需带 `Authorization: Bearer <token>`，否则放行（dry-run 无害）。
+    请求体（可选）：{"dry_run": false, "freshness_days": 7, "limit": 50}
+    """
+    import json as _json
+    import os
+    from starlette.responses import Response
+
+    try:
+        auth = request.headers.get("authorization", "")
+        expected = os.environ.get("OMBRE_DEHYDRATION_TOKEN") or os.environ.get("OMBRE_GATEWAY_TOKEN", "")
+        if expected and auth != f"Bearer {expected}":
+            return Response(_json.dumps({"error": "unauthorized"}), media_type="application/json", status_code=401)
+
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        dry_run = bool(body.get("dry_run", False))
+        freshness_days = body.get("freshness_days")
+        limit = int(body.get("limit", 50) or 50)
+        result = await run_delayed_dehydration(
+            dry_run=dry_run,
+            freshness_days=freshness_days,
+            limit=limit,
+        )
+        return Response(_json.dumps(result, ensure_ascii=False, default=str), media_type="application/json")
+    except Exception as e:
+        return Response(_json.dumps({"error": str(e)}), media_type="application/json", status_code=500)
 
 
 def _format_readonly_related_memory(bucket: dict) -> str:
@@ -7716,7 +7848,7 @@ async def breath(
                 break
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await dehydrator.dehydrate(_bucket_text_for_embedding(b), clean_meta)
+                summary = await _recall_render_content(b)
                 entry = f"📌 [核心准则] [bucket_id:{b['id']}] {summary}"
                 entry_tokens = count_tokens_approx(entry)
                 if entry_tokens > core_token_budget or entry_tokens > token_budget:
@@ -7736,7 +7868,7 @@ async def breath(
                 break
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await dehydrator.dehydrate(_bucket_text_for_embedding(b), clean_meta)
+                summary = await _recall_render_content(b)
                 entry = f"⚓ [长期锚点] [bucket_id:{b['id']}] {summary}"
                 entry_tokens = count_tokens_approx(entry)
                 if entry_tokens > anchor_token_budget or entry_tokens > token_budget:
@@ -7766,7 +7898,7 @@ async def breath(
                 break
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await dehydrator.dehydrate(_bucket_text_for_embedding(b), clean_meta)
+                summary = await _recall_render_content(b)
                 score = decay_engine.calculate_score(b["metadata"])
                 entry = f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}"
                 entry_tokens = count_tokens_approx(entry)

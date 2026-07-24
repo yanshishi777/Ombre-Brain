@@ -16,6 +16,10 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import uvicorn
+try:
+    from mcp.server.fastmcp import FastMCP
+except Exception:  # pragma: no cover - mcp may be absent in some runtimes
+    FastMCP = None
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
@@ -574,6 +578,22 @@ class GatewayService:
         self.skip_recent_rounds = max(0, int(self.gateway_cfg.get("skip_recent_rounds", 5)))
         self.cooldown_hours = float(self.gateway_cfg.get("cooldown_hours", 6))
         self.cooldown_floor = float(self.gateway_cfg.get("cooldown_floor", 0.3))
+        # --- Proactive recall (主动浮现) config ---
+        _proactive_cfg = self.gateway_cfg.get("proactive_recall", {}) or {}
+        self.proactive_recall_enabled = self._bool_config_value(
+            _proactive_cfg.get("enabled"), True
+        )
+        self.proactive_trigger_user_msgs = max(
+            1, int(_proactive_cfg.get("trigger_user_msgs", 10))
+        )
+        self.proactive_similarity_threshold = float(
+            _proactive_cfg.get("similarity_threshold", 0.48)
+        )
+        self.proactive_score_threshold = float(_proactive_cfg.get("score_threshold", 9))
+        self.proactive_cooldown_hours = float(_proactive_cfg.get("cooldown_hours", 4))
+        self.proactive_max_candidates = max(1, int(_proactive_cfg.get("max_candidates", 30)))
+        self.proactive_max_results = max(1, int(_proactive_cfg.get("max_results", 3)))
+        self.proactive_budget_chars = max(0, int(_proactive_cfg.get("budget_chars", 600)))
         self.semantic_session_dedupe_enabled = self._bool_config_value(
             self.gateway_cfg.get("semantic_session_dedupe_enabled"),
             True,
@@ -652,6 +672,8 @@ class GatewayService:
             float(self.gateway_cfg.get("bucket_list_cache_ttl_seconds", 300)),
         )
         self._bucket_list_cache: dict[bool, dict[str, Any]] = {}
+        # 已处理过的内存写工具调用 id，用于"写后即时清缓存"去重（避免每轮都失效）
+        self._seen_write_tool_ids: set[str] = set()
         self.diffusion_options = diffusion_options_from_config(config)
         self.diffusion_inject_max_items = max(
             0,
@@ -667,6 +689,8 @@ class GatewayService:
             min(8, int(self.gateway_cfg.get("diffusion_explore_multiplier", 3))),
         )
         self.core_memory_interval_rounds = max(1, int(self.gateway_cfg.get("core_memory_interval_rounds", 1)))
+        # Remote brain URL: 若设置则 gateway 的桶列表从 ombre-brain HTTP 读取（解决两服务存储隔离）
+        self.remote_brain_url = str(os.environ.get("OMBRE_BRAIN_URL", "") or "").strip().rstrip("/")
         self.word_map_hint_enabled = self._bool_config_value(
             self.gateway_cfg.get("word_map_hint_enabled"),
             False,
@@ -2591,7 +2615,7 @@ class GatewayService:
         if ttl > 0 and cached and now < float(cached.get("expires_at", 0.0)):
             return cached["buckets"]
 
-        buckets = await self.bucket_mgr.list_all(include_archive=include_archive)
+        buckets = await self._fetch_all_buckets(include_archive=include_archive)
         if ttl > 0:
             self._bucket_list_cache[key] = {
                 "buckets": buckets,
@@ -2600,6 +2624,118 @@ class GatewayService:
             }
         return buckets
 
+    async def _fetch_all_buckets(self, *, include_archive: bool = False) -> list[dict]:
+        """获取所有桶：优先从 remote brain HTTP 读取，fallback 本地。
+
+        解决 gateway 与 ombre-brain 两服务存储隔离导致 core_memory
+        注入读不到 pinned 桶的问题。OMBRE_BRAIN_URL 设置后启用 remote 模式。
+        """
+        if self.remote_brain_url:
+            try:
+                url = f"{self.remote_brain_url}/api/buckets/raw"
+                if include_archive:
+                    url += "?include_archive=true"
+                resp = await self.http_client.get(url, timeout=45.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    remote_buckets = data.get("buckets", [])
+                    if isinstance(remote_buckets, list):
+                        logger.info(
+                            "Gateway fetched buckets from remote brain | url=%s count=%s",
+                            self.remote_brain_url,
+                            len(remote_buckets),
+                        )
+                        return remote_buckets
+                logger.warning(
+                    "Gateway remote bucket fetch non-200 | status=%s url=%s",
+                    resp.status_code,
+                    self.remote_brain_url,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Gateway remote bucket fetch error | url=%s error=%s",
+                    self.remote_brain_url,
+                    exc,
+                )
+        return await self.bucket_mgr.list_all(include_archive=include_archive)
+
+    async def _run_proactive_recall(
+        self, session_id: str, current_user_query: str, messages: list[dict[str, Any]]
+    ) -> str:
+        """主动浮现：攒够用户消息后，调用 brain 的 /api/proactive-recall 拉取高相关记忆并格式化。
+
+        只把命中摘要回传给调用方，记忆库本身不出 gateway。失败/空结果都返回空串。
+        """
+        if not self.remote_brain_url:
+            return ""
+        user_texts = self._extract_recent_user_texts(messages, limit=6)
+        if not user_texts:
+            user_texts = [current_user_query] if current_user_query else []
+        if not user_texts:
+            return ""
+        payload = {"recent_messages": user_texts}
+        url = f"{self.remote_brain_url.rstrip('/')}/api/proactive-recall"
+        try:
+            resp = await self.http_client.post(url, json=payload, timeout=45.0)
+            if resp.status_code != 200:
+                logger.warning("proactive-recall non-200 | status=%s", resp.status_code)
+                return ""
+            data = resp.json()
+        except Exception as exc:
+            logger.warning("proactive-recall request failed: %s", exc)
+            return ""
+        hits = data.get("hits") or []
+        if not isinstance(hits, list) or not hits:
+            return ""
+        parts: list[str] = []
+        for hit in hits:
+            if not isinstance(hit, dict):
+                continue
+            name = str(hit.get("name") or "")
+            content = str(hit.get("content") or "")
+            if not content:
+                continue
+            parts.append(f"- {name}: {content}" if name else f"- {content}")
+        if not parts:
+            return ""
+        joined = "\n".join(parts)
+        if self.proactive_budget_chars and len(joined) > self.proactive_budget_chars:
+            joined = joined[: self.proactive_budget_chars] + "…"
+        return joined
+
+    @staticmethod
+    def _extract_recent_user_texts(messages: Any, limit: int = 6) -> list[str]:
+        texts: list[str] = []
+        if not isinstance(messages, list):
+            return texts
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") != "user":
+                continue
+            txt = GatewayService._message_plain_text(msg)
+            if txt:
+                texts.append(txt)
+        if len(texts) > limit:
+            texts = texts[-limit:]
+        return texts
+
+    @staticmethod
+    def _message_plain_text(msg: dict) -> str:
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            pieces: list[str] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype in {"text", "input_text"}:
+                    pieces.append(str(block.get("text") or ""))
+            return "\n".join(p for p in pieces if p).strip()
+        return ""
+
     def _clear_gateway_bucket_cache(self) -> None:
         self._bucket_list_cache.clear()
         self._moment_graph_cache_signature = ""
@@ -2607,6 +2743,65 @@ class GatewayService:
         self._moment_graph_cache_bucket_list_id = 0
         self._moment_graph_cache_edge_stamp = (0, 0)
         self._moment_graph_cache_store_stamp = (0, 0)
+
+    # 会改变 ombre-brain 桶内容/钉选状态的写记忆工具
+    _WRITE_MEMORY_TOOL_NAMES = frozenset(
+        {"hold", "trace", "grow", "comment_bucket", "reflect"}
+    )
+
+    def _invalidate_bucket_cache_on_new_memory_writes(
+        self, messages: list[dict[str, Any]] | None
+    ) -> bool:
+        """扫描本轮消息，若发现此前未处理过的"写记忆"工具调用（hold/trace/...），
+        立即清空网关桶列表缓存，使下一次拉取回到 ombre-brain 取实时数据。
+
+        只对已"新出现"的工具调用 id 生效，避免每轮都失效缓存、也避免历史消息里
+        的旧写操作反复触发。返回是否触发了失效。
+        """
+        if not isinstance(messages, list) or not messages:
+            return False
+        new_ids: list[str] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            # OpenAI 格式：assistant 消息带 tool_calls
+            tool_calls = msg.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    func = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    name = func.get("name")
+                    tid = tc.get("id")
+                    if name in self._WRITE_MEMORY_TOOL_NAMES and tid:
+                        if tid not in self._seen_write_tool_ids:
+                            new_ids.append(str(tid))
+                            self._seen_write_tool_ids.add(str(tid))
+            # Anthropic 格式兜底：content 内 tool_use 块
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") != "tool_use":
+                        continue
+                    name = block.get("name")
+                    tid = block.get("id")
+                    if name in self._WRITE_MEMORY_TOOL_NAMES and tid:
+                        if tid not in self._seen_write_tool_ids:
+                            new_ids.append(str(tid))
+                            self._seen_write_tool_ids.add(str(tid))
+        if not new_ids:
+            return False
+        # 防止长时间运行后集合无限增长；超限时重置（顶多导致一次额外失效，无害）
+        if len(self._seen_write_tool_ids) > 8000:
+            self._seen_write_tool_ids = set(new_ids)
+        self._clear_gateway_bucket_cache()
+        logger.info(
+            "Bucket cache invalidated after memory write tools | ids=%s",
+            new_ids[:8],
+        )
+        return True
 
     async def prepare_payload(
         self,
@@ -2636,12 +2831,27 @@ class GatewayService:
         mark_step("resolve_model", stage_started_at)
 
         stage_started_at = time.perf_counter()
+        # 写记忆工具（hold/trace/...）调用后即时清桶缓存，避免新窗口/下一轮读到旧缓存
+        self._invalidate_bucket_cache_on_new_memory_writes(messages)
         all_buckets = await self._list_gateway_buckets(include_archive=False)
         mark_step("list_all_buckets", stage_started_at)
 
         stage_started_at = time.perf_counter()
         current_user_query = self._extract_current_turn_user_query(messages)
         is_new_user_turn = bool(current_user_query)
+        should_run_proactive = False
+        if is_new_user_turn and self.proactive_recall_enabled:
+            try:
+                _proactive_cnt = self.state_store.increment_proactive_user_msg_count(session_id)
+            except Exception as _pe:
+                logger.warning("proactive user-msg count increment failed: %s", _pe)
+                _proactive_cnt = 0
+            if _proactive_cnt >= self.proactive_trigger_user_msgs:
+                try:
+                    self.state_store.reset_proactive_user_msg_count(session_id)
+                except Exception:
+                    pass
+                should_run_proactive = True
         has_handoff_context = self._messages_contain_handoff_context(messages)
         is_session_start = self.state_store.get_last_success_at(session_id) is None
         just_now_context_requested = (
@@ -2701,6 +2911,7 @@ class GatewayService:
         grouped_moments: dict[str, list[dict]] = {}
         moment_edges: list[dict] = []
         recalled_memory = ""
+        proactive_memory = ""
         date_persona_trace = ""
         date_persona_trace_debug: dict[str, Any] = self._date_persona_trace_debug_base(current_user_query)
         relationship_weather = ""
@@ -2864,7 +3075,9 @@ class GatewayService:
                 channel="gateway",
             )
             mark_step("active_reminders", stage_started_at)
-            if not needs_handoff_first and not just_now_context_requested and not date_recall_requested and self._should_inject_interval(
+            # core_memory (pinned 桶) 每轮注入，不被 just_now/date_recall 跳过
+            # 称呼纠正等核心规则应在所有对话模式下生效，不能因时间词/记忆查询词而漏注入
+            if not needs_handoff_first and self._should_inject_interval(
                 session_id,
                 self.core_memory_interval_rounds,
             ):
@@ -3148,6 +3361,15 @@ class GatewayService:
                 session_id,
             )
 
+        if should_run_proactive:
+            try:
+                proactive_memory = await self._run_proactive_recall(
+                    session_id, current_user_query, messages
+                )
+            except Exception as _pre:
+                logger.warning("proactive recall failed: %s", _pre)
+                proactive_memory = ""
+
         stage_started_at = time.perf_counter()
         stable_context, dynamic_context = self._build_injected_context_messages(
             persona_block=persona_block,
@@ -3168,6 +3390,7 @@ class GatewayService:
             memory_detail_recall_instruction=memory_detail_recall_instruction,
             handoff_tool_hint=handoff_tool_hint,
             context_mode=context_mode,
+            proactive_memory=proactive_memory,
         )
         mark_step("build_context_messages", stage_started_at)
 
@@ -7673,7 +7896,32 @@ class GatewayService:
             ),
             reverse=True,
         )
-        return await self._summarize_buckets(core_buckets, self.core_budget)
+        # pinned/protected 桶走原文注入，不走 dehydrator 压缩
+        # 保留原始指令语气（如"一个都不行""绝对不能用"），避免被摘要弱化成弱标签导致 AI 不遵守
+        parts = []
+        for bucket in core_buckets:
+            content = str(bucket.get("content", "") or "").strip()
+            if not content:
+                continue
+            name = str(bucket.get("metadata", {}).get("name", "") or "").strip()
+            if name and name != str(bucket.get("id", "")):
+                line = f"- [{name}] {content}"
+            else:
+                line = f"- {content}"
+            parts.append(self._trim_text(line, 200))
+        result = "\n".join(parts)
+        max_chars = max(800, self.core_budget * 4)
+        if len(result) > max_chars:
+            result = result[:max_chars].rsplit("\n", 1)[0]
+        logger.info(
+            "Gateway core_memory build | all_buckets=%s core_buckets=%s budget=%s result_len=%s preview=%s",
+            len(all_buckets),
+            len(core_buckets),
+            self.core_budget,
+            len(result),
+            (result or "")[:160],
+        )
+        return result
 
     def _build_portrait_memory_block(self, all_buckets: list[dict]) -> tuple[str, dict[str, Any]]:
         debug = self._portrait_memory_debug_base()
@@ -17812,6 +18060,7 @@ class GatewayService:
         context_mode: str = "",
         date_persona_trace: str = "",
         date_recall: str = "",
+        proactive_memory: str = "",
     ) -> tuple[str, str]:
         has_dynamic_context = any(
             section.strip()
@@ -17832,6 +18081,7 @@ class GatewayService:
                 dream_context,
                 active_reminders,
                 context_mode,
+                proactive_memory,
             ]
         )
         has_memory_reading_context = any(
@@ -17852,8 +18102,9 @@ class GatewayService:
         stable_sections = []
         if core_memory.strip() or portrait_memory.strip():
             stable_sections = [
-                "Use the following private memory only when it fits naturally. "
-                "Keep the reply seamless and do not mention memory lookup, search, or hidden context.",
+                "The following are core rules and pinned commitments. "
+                "You MUST strictly follow them in every reply — they are non-negotiable. "
+                "Do not mention memory lookup, search, or hidden context.",
             ]
 
             def add_stable_section(title: str, content: str) -> None:
@@ -17888,7 +18139,22 @@ class GatewayService:
                     "Date Boundary",
                     "[created:YYYY-MM-DD] is the bucket record date, not necessarily the event date; prefer event dates in the memory text.",
                 )
+            if recalled_memory.strip():
+                recalled_memory = (
+                    "（以下是过去发生之事的压缩摘要，不含具体情绪细节。"
+                    "请结合当前对话氛围与你们关系的性质，自己判断现在提到这件事该表现出什么情感浓度和语气，"
+                    "不要机械复述，而要让它自然地影响你当下的反应。）\n"
+                    + recalled_memory
+                )
             add_section("Recalled Memory", recalled_memory)
+            if proactive_memory.strip():
+                add_section(
+                    "Proactively Surfaced Memory",
+                    "（以下是经过筛选、确定与当前话题高度相关的记忆，适合由你自然地主动提起——"
+                    "不要生硬地“突然想起”，而是让它像你此刻真实想聊起的事一样，顺带、不经意地融入回应。"
+                    "是否提起、怎么提起，由你判断；若当前对话完全不涉及，也可以不提。不要提及“记忆”或隐藏上下文。）\n"
+                    + proactive_memory,
+                )
             add_section("Targeted Memory Detail", targeted_memory_detail)
             add_section("Diffused Memory", related_memory)
             add_section("Recent Context", recent_context)
@@ -21099,12 +21365,99 @@ def create_gateway_app(
     config = config or load_config()
     service = service or GatewayService(config)
 
+    # --- MCP server: lets Claude Code (CC) connect to the Gateway and pull
+    #     Gateway-curated memory (the SAME prepare_payload pipeline the web /
+    #     Dashboard chat path uses) instead of talking to brain directly. ---
+    # Defensive: if `mcp` is missing/incompatible in the deploy image, or the
+    # FastMCP setup raises for any reason, we MUST still boot the gateway for
+    # web users. Skip MCP in that case and log the real error so it surfaces in
+    # the deploy logs instead of failing the whole container silently.
+    gw_mcp = None
+    try:
+        if FastMCP is None:
+            raise RuntimeError("mcp package not importable (FastMCP is None)")
+        gw_mcp = FastMCP("ombre-gateway")
+        gw_mcp.settings.streamable_http_path = "/"
+        # The gateway is deployed on a public Railway hostname, so FastMCP's
+        # default transport-security (DNS-rebinding Host allowlist = localhost
+        # only) rejects every real request with 421 "Invalid Host header".
+        # Real auth is enforced upstream by _MCPBearerGate, so we disable the
+        # Host/Origin allowlist check here.
+        try:
+            from mcp.server.transport_security import TransportSecuritySettings
+
+            gw_mcp.settings.transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=False
+            )
+        except Exception:  # pragma: no cover - never fatal
+            pass
+
+        @gw_mcp.tool()
+        async def get_ombre_memory(query: str, session_id: str = "cc") -> str:
+            """按当前对话内容，从 ombre-brain 检索并经 Gateway 精加工后返回相关记忆文本（含 pinned 规则、情感浓度引导、主动浮现等）。Claude Code 每轮开头调用本工具，带着当前问题，据此回答。"""
+            try:
+                _fwd, _ids, debug = await service.prepare_payload(
+                    {
+                        "model": service.upstream_default_model
+                        or (service.upstream_models[0] if service.upstream_models else ""),
+                        "messages": [{"role": "user", "content": query}],
+                        "stream": False,
+                    },
+                    session_id,
+                    include_debug=True,
+                    debug_detail="compact",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("get_ombre_memory prepare_payload failed: %s", exc)
+                return ""
+            dynamic = service._clip_text(
+                service._hook_recall_full_dynamic_context(debug, include_diffused=True),
+                4200,
+            )
+            return service._render_hook_recall_full_additional_context(dynamic)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "MCP server init failed; gateway will run WITHOUT /mcp: %s",
+            exc,
+            exc_info=True,
+        )
+        gw_mcp = None
+
+    class _MCPBearerGate:
+        """Wrap the MCP app so every HTTP request must carry a valid Gateway Bearer token."""
+
+        def __init__(self, app, svc):
+            self.app = app
+            self.service = svc
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http":
+                auth = ""
+                for key, val in scope.get("headers", []):
+                    if key == b"authorization":
+                        try:
+                            auth = val.decode("latin-1")
+                        except Exception:
+                            auth = ""
+                        break
+                if self.service._authorize(auth) is not None:
+                    resp = JSONResponse({"error": "unauthorized"}, status_code=401)
+                    await resp(scope, receive, send)
+                    return
+            await self.app(scope, receive, send)
+
     @asynccontextmanager
     async def lifespan(app: Starlette):
         app.state.gateway_service = service
-        await service.warm_recall_runtime()
-        yield
-        await service.close()
+        if gw_mcp is not None:
+            async with gw_mcp.session_manager.run():
+                await service.warm_recall_runtime()
+                yield
+                await service.close()
+        else:
+            await service.warm_recall_runtime()
+            yield
+            await service.close()
 
     async def health(request: Request) -> JSONResponse:
         return await request.app.state.gateway_service.handle_health(request)
@@ -21155,6 +21508,10 @@ def create_gateway_app(
         allow_headers=["*"],
         expose_headers=["*"],
     )
+    if gw_mcp is not None:
+        app.mount("/mcp", _MCPBearerGate(gw_mcp.streamable_http_app(), service))
+    else:
+        logger.warning("MCP mount skipped: gw_mcp is None (gateway runs without /mcp)")
     return app
 
 

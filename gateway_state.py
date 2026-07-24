@@ -138,6 +138,15 @@ class GatewayStateStore:
             ON upstream_usage (session_id, id DESC)
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS proactive_user_msgs (
+                session_id TEXT NOT NULL PRIMARY KEY,
+                msg_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
         conn.close()
 
@@ -692,6 +701,45 @@ class GatewayStateStore:
             return 1.0
         progress = elapsed_hours / cooldown_hours
         return round(cooldown_floor + (1.0 - cooldown_floor) * progress, 4)
+
+    def get_proactive_user_msg_count(self, session_id: str) -> int:
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT msg_count FROM proactive_user_msgs WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        conn.close()
+        return int(row["msg_count"]) if row else 0
+
+    def increment_proactive_user_msg_count(self, session_id: str) -> int:
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        conn = self._connect()
+        conn.execute(
+            """
+            INSERT INTO proactive_user_msgs (session_id, msg_count, updated_at)
+            VALUES (?, 1, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                msg_count = msg_count + 1,
+                updated_at = excluded.updated_at
+            """,
+            (session_id, now_iso),
+        )
+        row = conn.execute(
+            "SELECT msg_count FROM proactive_user_msgs WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        conn.commit()
+        conn.close()
+        return int(row["msg_count"]) if row else 0
+
+    def reset_proactive_user_msg_count(self, session_id: str) -> None:
+        conn = self._connect()
+        conn.execute(
+            "DELETE FROM proactive_user_msgs WHERE session_id = ?",
+            (session_id,),
+        )
+        conn.commit()
+        conn.close()
 
 
 def _optional_int(value: Any) -> int | None:

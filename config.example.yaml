@@ -339,6 +339,15 @@ gateway:
         - "claude-sonnet-5"
         - "claude-haiku-4-5"
         - "claude-opus-4-6"
+    - name: "xiaoji"
+      protocol: "openai"
+      base_url: "https://api2.68886868.xyz/v1"
+      api_key_env: "OMBRE_GATEWAY_XIAOJI_API_KEY"
+      default_model: "claude-opus-4-6-thinking"
+      prompt_cache: ""
+      models:
+        - id: "claude-opus-4-6-thinking"
+          upstream_model: "[Kiro次] claude-opus-4-6-thinking [不补]"
   head_recent_hours: 72
   recent_context_reentry_idle_hours: 24
   recent_context_cooldown_hours: 6
@@ -351,7 +360,7 @@ gateway:
   semantic_session_dedupe_threshold: 0.90
   semantic_session_dedupe_lexical_threshold: 0.82
   inject_total_budget: 1800
-  core_memory_budget: 0
+  core_memory_budget: 2000
   recent_context_budget: 300
   just_now_context_enabled: true     # 刚刚/刚才/上一句: use short-term conversation_turns, not long-term memory
   just_now_context_hours: 6
@@ -484,6 +493,18 @@ gateway:
   #   OMBRE_GATEWAY_DEEPSEEK_API_KEY_2
   #   OMBRE_GATEWAY_SILICONFLOW_API_KEY
   #   OMBRE_GATEWAY_ANTHROPIC_API_KEY
+
+  # --- Proactive recall (主动浮现) ---
+  # 攒够用户消息数后，自动语义检索高相关记忆并自然浮现。
+  proactive_recall:
+    enabled: true                   # 总开关
+    trigger_user_msgs: 10           # 每会话累计用户消息数达到即触发一次检索
+    similarity_threshold: 0.48      # 向量粗筛门槛（余弦相似度），低于则进不了候选
+    score_threshold: 9              # LLM 相关度分门槛（0-10），门槛要高避免硬凑回忆
+    cooldown_hours: 4               # 同一条记忆冷却时间，避免变成复读机
+    max_candidates: 30              # 粗筛候选上限
+    max_results: 3                  # 单次浮现上限
+    budget_chars: 600              # 注入字符预算
 
 memory_diffusion:
   enabled: true

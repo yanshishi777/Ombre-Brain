@@ -22,3 +22,6 @@ backup_*/
 *.db
 import_state.json
 .codex
+CREDENTIALS.md
+connection_guide.txt
+start_mobile.sh

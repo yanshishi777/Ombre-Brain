@@ -202,6 +202,14 @@ class BucketManager:
                     continue
                 metadata[str(key)] = value
 
+        # --- Delayed dehydration bookkeeping / 延迟脱水记账 ---
+        # dynamic 且非钉选/保护的记忆默认进入保鲜期（fresh），其余不设，
+        # 保持原有「实时脱水注入摘要」行为，向后兼容历史桶。
+        is_delay_dehydratable = (bucket_type == "dynamic") and (not pinned) and (not protected)
+        metadata["raw_content"] = None
+        metadata["dehydration_state"] = "fresh" if is_delay_dehydratable else None
+        metadata["dehydrated_at"] = None
+
         # --- Assemble Markdown file (frontmatter + body) ---
         # --- 组装 Markdown 文件 ---
         post = frontmatter.Post(linked_content, **metadata)
@@ -337,6 +345,12 @@ class BucketManager:
             post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
         if "source" in kwargs:
             post["source"] = str(kwargs["source"])
+        if "raw_content" in kwargs:
+            post["raw_content"] = kwargs["raw_content"]
+        if "dehydration_state" in kwargs:
+            post["dehydration_state"] = kwargs["dehydration_state"]
+        if "dehydrated_at" in kwargs:
+            post["dehydrated_at"] = kwargs["dehydrated_at"]
         if "confidence" in kwargs:
             post["confidence"] = max(0.0, min(1.0, float(kwargs["confidence"])))
         if "period" in kwargs:

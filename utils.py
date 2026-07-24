@@ -190,6 +190,7 @@ def load_config(config_path: str = None) -> dict:
             "max_candidates": 20,
             "max_text_chars": 220,
         },
+        "dehydrated_freshness_days": 7,
         "recall_thresholds": {
             "vector_min_score": 0.50,
             "facet_vector_min_score": 0.45,
@@ -734,6 +735,17 @@ def load_config(config_path: str = None) -> dict:
             "yes",
             "on",
         )
+
+    # --- Delayed dehydration window (N days) / 延迟脱水时间窗口 ---
+    # 环境变量可覆盖内置默认（7 天）。0/负数视为不覆盖。
+    env_freshness_days = os.environ.get("OMBRE_DEHYDRATE_FRESHNESS_DAYS", "")
+    if env_freshness_days:
+        try:
+            days = int(env_freshness_days)
+            if days > 0:
+                config["dehydrated_freshness_days"] = days
+        except ValueError:
+            pass
 
     # --- Ensure bucket storage directories exist ---
     # --- 确保记忆桶存储目录存在 ---
