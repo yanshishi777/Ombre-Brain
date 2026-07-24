@@ -191,6 +191,8 @@ def load_config(config_path: str = None) -> dict:
             "max_text_chars": 220,
         },
         "dehydrated_freshness_days": 7,
+        "delayed_dehydration_loop": True,
+        "delayed_dehydration_loop_minutes": 60,
         "recall_thresholds": {
             "vector_min_score": 0.50,
             "facet_vector_min_score": 0.45,
@@ -744,6 +746,25 @@ def load_config(config_path: str = None) -> dict:
             days = int(env_freshness_days)
             if days > 0:
                 config["dehydrated_freshness_days"] = days
+        except ValueError:
+            pass
+
+    # --- Delayed dehydration resident loop / 延迟脱水常驻循环开关 ---
+    # 环境变量 OMBRE_DD_LOOP 设为 0/false/no/off 可关闭；OMBRE_DD_LOOP_MINUTES 覆盖间隔。
+    env_dd_loop = os.environ.get("OMBRE_DD_LOOP", "")
+    if env_dd_loop:
+        config["delayed_dehydration_loop"] = env_dd_loop.lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+    env_dd_interval = os.environ.get("OMBRE_DD_LOOP_MINUTES", "")
+    if env_dd_interval:
+        try:
+            mins = int(env_dd_interval)
+            if mins > 0:
+                config["delayed_dehydration_loop_minutes"] = mins
         except ValueError:
             pass
 

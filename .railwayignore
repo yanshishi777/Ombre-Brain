@@ -1,0 +1,13 @@
+.git
+.gitignore
+.railway
+.venv
+venv
+env
+node_modules
+__pycache__
+*.pyc
+*.log
+buckets
+CREDENTIALS.md
+fix_address.py

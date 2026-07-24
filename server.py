@@ -14192,6 +14192,31 @@ if __name__ == "__main__":
         dt.start()
         logger.info("Dream scheduler loop started / 夜梦定时器循环已启动")
 
+        # --- Delayed dehydration resident loop / 延迟脱水常驻循环 ---
+        # 与 brain 同进程、同 bucket_mgr，周期性把超期 fresh 桶固化脱水为摘要。
+        # 默认开启，可用 OMBRE_DD_LOOP=0 关闭、OMBRE_DD_LOOP_MINUTES 调间隔。
+        async def _delayed_dehydration_loop():
+            await asyncio.sleep(15)
+            interval_minutes = int(config.get("delayed_dehydration_loop_minutes", 60) or 60)
+            while True:
+                try:
+                    result = await run_delayed_dehydration(dry_run=False, limit=50)
+                    if result.get("processed"):
+                        logger.info("Delayed dehydration run / 延迟脱水定时执行: %s", result)
+                except Exception as e:
+                    logger.warning("Delayed dehydration loop failed / 延迟脱水定时器失败: %s", e)
+                await asyncio.sleep(interval_minutes * 60)
+
+        def _start_delayed_dehydration_scheduler():
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(_delayed_dehydration_loop())
+
+        dd_enabled = bool(config.get("delayed_dehydration_loop", True))
+        if dd_enabled:
+            ddt = threading.Thread(target=_start_delayed_dehydration_scheduler, daemon=True)
+            ddt.start()
+            logger.info("Delayed dehydration scheduler enabled / 延迟脱水定时器已启用")
+
         # --- Add CORS middleware so remote clients (Cloudflare Tunnel / ngrok) can connect ---
         # --- 添加 CORS 中间件，让远程客户端（Cloudflare Tunnel / ngrok）能正常连接 ---
         if transport == "streamable-http":
