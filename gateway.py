@@ -2858,6 +2858,7 @@ class GatewayService:
             self.just_now_context_enabled
             and self._query_requests_just_now_context(current_user_query)
         )
+        logger.error("JN_DBG just_now_context_requested=%s enabled=%s query=%r", just_now_context_requested, self.just_now_context_enabled, (current_user_query or "")[:60])
         is_handoff_trigger_query = self._query_is_handoff_trigger(current_user_query)
         handoff_just_now_requested = (
             just_now_context_requested
@@ -3116,6 +3117,7 @@ class GatewayService:
                             ),
                             allow_semantic_session_dedupe=False,
                         )
+                        logger.error("JN_DBG just_now _select_dynamic_buckets returned %d buckets | search_query=%r", len(jn_buckets), self._dynamic_recall_search_query(current_user_query, memory_sentinel_debug))
                         for bucket in jn_buckets:
                             bucket_id = str(bucket.get("id") or "")
                             if not bucket_id:
