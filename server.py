@@ -3455,17 +3455,19 @@ def _extract_event_date(name: str, content: str, meta: dict) -> tuple[str | None
 
 @mcp.custom_route("/api/admin/migrate-backfill", methods=["POST"])
 async def api_migrate_backfill(request):
-    """遗留桶元数据回填：date(事件日期) + proactive_eligible。
+    """遗留桶元数据回填：date(事件日期) + proactive_eligible + dehydration_state。
 
     鉴权：memory-write token（OMBRE_GATEWAY_TOKEN），走 raw-api auth。
     请求体：
       dry_run (bool, 默认 true): 只生成计划，不写库。
       limit (int, 默认 0=不限): 实际应用时最多改 N 个桶。
-      modes (list[str], 默认 ["date","proactive"]): 回填哪些字段。
+      modes (list[str], 默认 ["date","proactive","dehydration"]): 回填哪些字段。
     规则：
       date 优先级：内容日期 > created > last_active。
       proactive_eligible=True 仅给 type in (dynamic, permanent)，
       排除 dont_surface / deleted_at / type==archived 的桶。
+      dehydration_state="fresh" 仅给 type==dynamic 且当前 state 为 None 的桶
+      （让延迟脱水 worker 能接管；permanent 桶 worker 不处理故跳过）。
     """
     from starlette.responses import JSONResponse
 
@@ -3480,7 +3482,7 @@ async def api_migrate_backfill(request):
         body = {}
     dry_run = _bool_value(body.get("dry_run"), True)
     limit = _int_between(body.get("limit"), 0, 0, 2000)
-    modes = body.get("modes") or ["date", "proactive"]
+    modes = body.get("modes") or ["date", "proactive", "dehydration"]
     if isinstance(modes, str):
         modes = [modes]
 
@@ -3513,6 +3515,8 @@ async def api_migrate_backfill(request):
             changes["date"] = date_val
         if "proactive" in modes and eligible_proactive and meta.get("proactive_eligible") is not True:
             changes["proactive_eligible"] = True
+        if "dehydration" in modes and btype == "dynamic" and meta.get("dehydration_state") is None:
+            changes["dehydration_state"] = "fresh"
         if not changes:
             continue
         plan.append({"id": bid, "type": btype, "changes": changes, "date_source": date_source})

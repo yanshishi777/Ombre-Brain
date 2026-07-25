@@ -3103,6 +3103,40 @@ class GatewayService:
                         session_id,
                         query_planner_debug.get("skip_reason") or "targeted_memory_detail_query",
                     )
+                    if just_now_context_requested and self.retrieval_mode == "bucket":
+                        # just_now 场景：仍补一遍轻量语义召回，让"刚刚X"也能接上相关长程记忆。
+                        # 不因此丢失 just_now 的短上下文（它单独注入），只是额外带相关历史。
+                        stage_started_at = time.perf_counter()
+                        jn_buckets, _ = await self._select_dynamic_buckets(
+                            current_user_query,
+                            session_id,
+                            all_buckets,
+                            search_query=current_user_query,
+                            allow_query_planner=False,
+                            allow_semantic_session_dedupe=False,
+                        )
+                        for bucket in jn_buckets:
+                            bucket_id = str(bucket.get("id") or "")
+                            if not bucket_id:
+                                continue
+                            signal = (
+                                bucket.get("_recall_signal")
+                                if isinstance(bucket.get("_recall_signal"), dict)
+                                else {}
+                            )
+                            bucket_moments = self._direct_moments_for_bucket(bucket, current_user_query)
+                            moment = self._representative_moment(bucket_moments)
+                            if not moment:
+                                moment = self._source_record_synthetic_moment_for_bucket(
+                                    bucket, current_user_query, selected_reason="just_now_recall"
+                                )
+                            if not moment:
+                                continue
+                            moment = self._moment_with_bucket_recall_signal(moment, signal)
+                            grouped_moments[bucket_id] = bucket_moments
+                            recalled_moments.append(moment)
+                        moment_candidates = list(recalled_moments)
+                        mark_step("just_now_dynamic_recall", stage_started_at)
                     suppressed_moments = []
                     suppressed_buckets = []
                 elif self.retrieval_mode == "bucket":
