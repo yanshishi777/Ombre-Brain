@@ -3329,7 +3329,7 @@ async def api_proactive_recall(request):
         _gw_cfg = config.get("gateway", {}) or {}
         _pc_cfg = _gw_cfg.get("proactive_recall", {}) or {}
         similarity_threshold = float(_pc_cfg.get("similarity_threshold", 0.48))
-        score_threshold = float(_pc_cfg.get("score_threshold", 9))
+        score_threshold = float(_pc_cfg.get("score_threshold", 7))
         cooldown_hours = float(_pc_cfg.get("cooldown_hours", 4))
         max_candidates = max(1, int(_pc_cfg.get("max_candidates", 30)))
         max_results = max(1, int(_pc_cfg.get("max_results", 3)))

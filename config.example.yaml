@@ -500,7 +500,7 @@ gateway:
     enabled: true                   # 总开关
     trigger_user_msgs: 10           # 每会话累计用户消息数达到即触发一次检索
     similarity_threshold: 0.48      # 向量粗筛门槛（余弦相似度），低于则进不了候选
-    score_threshold: 9              # LLM 相关度分门槛（0-10），门槛要高避免硬凑回忆
+    score_threshold: 7              # LLM 相关度分门槛（0-10），适中即可避免硬凑回忆
     cooldown_hours: 4               # 同一条记忆冷却时间，避免变成复读机
     max_candidates: 30              # 粗筛候选上限
     max_results: 3                  # 单次浮现上限

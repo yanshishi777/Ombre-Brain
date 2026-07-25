@@ -589,7 +589,7 @@ class GatewayService:
         self.proactive_similarity_threshold = float(
             _proactive_cfg.get("similarity_threshold", 0.48)
         )
-        self.proactive_score_threshold = float(_proactive_cfg.get("score_threshold", 9))
+        self.proactive_score_threshold = float(_proactive_cfg.get("score_threshold", 7))
         self.proactive_cooldown_hours = float(_proactive_cfg.get("cooldown_hours", 4))
         self.proactive_max_candidates = max(1, int(_proactive_cfg.get("max_candidates", 30)))
         self.proactive_max_results = max(1, int(_proactive_cfg.get("max_results", 3)))
