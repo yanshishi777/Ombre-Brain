@@ -303,6 +303,11 @@ DATE_RECALL_BROAD_QUERY_MARKERS = frozenset(
         "搞了什么", "整什么", "干嘛了", "干什么了", "聊啥", "说啥", "提啥",
     }
 )
+# 剥掉疑问词/助词后，若只剩这些泛化动作动词（如“干/做/发生/来/去”），也算泛化日期查询。
+_DATE_RECALL_GENERIC_VERBS = frozenset(
+    {"干", "做", "发生", "来", "去", "有", "是", "搞", "整", "弄", "玩", "搞啥", "整啥", "弄啥"}
+)
+_DATE_RECALL_GENERIC_VERB_CHARS = frozenset("干做发生来去有是搞整弄玩")
 MEMORY_SENTINEL_RESIDUE_STOP_TERMS = query_intent_term_set("memory_sentinel.residue_stop_terms")
 MEMORY_SENTINEL_RESIDUE_PREFIXES = query_intent_terms("memory_sentinel.residue_prefixes")
 MEMORY_SENTINEL_SKIP_ONLY_TERMS = query_intent_term_set("memory_sentinel.skip_only_terms")
@@ -8627,7 +8632,12 @@ class GatewayService:
             residue = residue.replace(marker, " ")
         residue = re.sub(r"[的了着过吗呢吧啊哦呀嘛哈咯还啦呗哟额喂]", "", residue)
         residue = re.sub(r"\s+", "", residue)
-        return not residue
+        if not residue:
+            return True
+        # 剥离后只剩泛化动作动词（如“干/做/发生”），也视为泛化日期查询。
+        if residue in _DATE_RECALL_GENERIC_VERBS:
+            return True
+        return all(ch in _DATE_RECALL_GENERIC_VERB_CHARS for ch in residue) and len(residue) <= 4
 
     def _query_has_explicit_date_topic(self, query: str) -> bool:
         text = str(query or "").strip()
