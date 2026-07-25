@@ -668,6 +668,12 @@ class GatewayService:
         self.date_recall_budget = max(0, int(self.gateway_cfg.get("date_recall_budget", 520)))
         self.date_recall_max_turns = max(1, min(12, int(self.gateway_cfg.get("date_recall_max_turns", 8))))
         self.date_recall_max_buckets = max(0, min(8, int(self.gateway_cfg.get("date_recall_max_buckets", 4))))
+        # 当 date_recall 查询某天但没有任何记录时，注入一条“未找到”提示，
+        # 防止模型 fallback 到外部工具并产生幻觉（如把年份错解成 2025）。
+        self.date_recall_inform_when_empty = self._bool_config_value(
+            self.gateway_cfg.get("date_recall_inform_when_empty"),
+            True,
+        )
         gateway_timezone = str(
             self.gateway_cfg.get("timezone")
             or (config.get("reflection", {}) if isinstance(config.get("reflection", {}), dict) else {}).get("timezone")
@@ -956,6 +962,7 @@ class GatewayService:
                 "date_recall_budget": self.date_recall_budget,
                 "date_recall_max_turns": self.date_recall_max_turns,
                 "date_recall_max_buckets": self.date_recall_max_buckets,
+                "date_recall_inform_when_empty": self.date_recall_inform_when_empty,
                 "recalled_memory_budget": self.recalled_budget,
                 "recalled_moment_cap": self.recalled_moment_cap,
                 "related_memory_budget": self.related_memory_budget,
@@ -1041,6 +1048,7 @@ class GatewayService:
             "date_recall_budget": self.date_recall_budget,
             "date_recall_max_turns": self.date_recall_max_turns,
             "date_recall_max_buckets": self.date_recall_max_buckets,
+            "date_recall_inform_when_empty": self.date_recall_inform_when_empty,
             "recalled_memory_budget": self.recalled_budget,
             "recalled_moment_cap": self.recalled_moment_cap,
             "related_memory_budget": self.related_memory_budget,
@@ -1527,6 +1535,12 @@ class GatewayService:
             self.date_recall_max_buckets = max(0, min(8, int(payload["date_recall_max_buckets"])))
             self.gateway_cfg["date_recall_max_buckets"] = self.date_recall_max_buckets
             updated.append("gateway.date_recall_max_buckets")
+        if "date_recall_inform_when_empty" in payload:
+            self.date_recall_inform_when_empty = self._bool_config_value(
+                payload["date_recall_inform_when_empty"], True
+            )
+            self.gateway_cfg["date_recall_inform_when_empty"] = self.date_recall_inform_when_empty
+            updated.append("gateway.date_recall_inform_when_empty")
         if "recalled_memory_budget" in payload:
             self.recalled_budget = max(0, int(payload["recalled_memory_budget"]))
             self.gateway_cfg["recalled_memory_budget"] = self.recalled_budget
@@ -7899,6 +7913,10 @@ class GatewayService:
             return False
         if any(marker in compact for marker in DATE_RECALL_CHAT_MARKERS):
             return False
+        # 如果用户问的是“某天+某主题”（如“7月25号我听的歌”），应走 date_recall，
+        # 而不是因为 query 里含“什么”就当成 identity/name 查询。
+        if self._query_date_recall_hint(text) and self._query_has_explicit_date_topic(text):
+            return False
         return any(marker in compact for marker in IDENTITY_NAME_EVENT_MARKERS) or bool(
             self._query_date_recall_hint(text)
         )
@@ -8360,7 +8378,21 @@ class GatewayService:
         )
         if not turns and not buckets:
             debug["skip_reason"] = "no_material"
-            return "", debug, []
+            debug["status"] = "empty"
+            if not self.date_recall_inform_when_empty:
+                return "", debug, []
+            # 注入明确的“未找到”提示，防止模型 fallback 到外部工具时产生幻觉。
+            lines = [
+                f"Date-bounded recall for {date_key} ({hint['label']}): no matching records found.",
+                "Do not invent or assume events for this date. If the user asks again, you may ask them to tell you what happened.",
+            ]
+            if topic_terms:
+                lines.insert(
+                    1,
+                    f"topic_filter ({', '.join(topic_terms[:8])}) returned zero same-day memories.",
+                )
+            text = self._trim_text("\n".join(lines), self.date_recall_budget)
+            return text, debug, []
 
         lines = [
             f"Date-bounded recall for {date_key} ({hint['label']}).",
@@ -8569,7 +8601,12 @@ class GatewayService:
         hint = self._query_date_recall_hint(text)
         if not hint:
             return False
-        return bool(self._date_recall_protected_topic_terms(text))
+        if self._date_recall_protected_topic_terms(text):
+            return True
+        # 去掉日期外壳和 shell 词后，只要有实际主题词（如“歌”“音乐”“代码”），
+        # 就认为用户在问“某一天的某类事”，应触发 date_recall。
+        topic_terms = self._date_recall_topic_terms(text)
+        return bool(topic_terms)
 
     def _query_requires_role_safe_date_transcript(self, query: str) -> bool:
         compact = self._compact_lookup_key(query)
@@ -8618,7 +8655,13 @@ class GatewayService:
     def _strip_date_recall_query_shell(self, query: str) -> str:
         text = strip_human_date_references(query)
         shell_terms = date_recall_shell_terms(self.identity) | DATE_RECALL_ROLE_QUERY_SHELL_TERMS
-        for term in sorted(shell_terms, key=lambda item: len(str(item)), reverse=True):
+        # 只去掉多字 shell terms；单字助词（如“的”“是”“吗”）留给 specific_query_terms 过滤，
+        # 避免把“听歌”拆成“听 歌”导致后续去重时被当成单字丢弃。
+        for term in sorted(
+            (t for t in shell_terms if len(str(t).strip()) >= 2),
+            key=lambda item: len(str(item)),
+            reverse=True,
+        ):
             if str(term).strip():
                 text = text.replace(str(term), " ")
         return re.sub(r"[\s，。！？、,.!?:：;；~～（）()\[\]【】「」『』“”\"'`]+", " ", text).strip()
