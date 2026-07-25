@@ -2893,7 +2893,13 @@ class GatewayService:
         is_session_start = self.state_store.get_last_success_at(session_id) is None
         just_now_context_requested = (
             self.just_now_context_enabled
-            and self._query_requests_just_now_context(current_user_query)
+            and (
+                self._query_requests_just_now_context(current_user_query)
+                # 口语化"指代过去共同经历"的问法（上次/那次/之前聊/最近记忆/last time 等）
+                # 与"刚刚X"同属一类：应走轻量召回 + brain 语义兜底，而非网关自身（无 embedding 索引）
+                # 的普通召回。off-topic 查询无此类标记，故不会误触发、无副作用注入。
+                or self._query_requests_recent_context(current_user_query)
+            )
         )
         is_handoff_trigger_query = self._query_is_handoff_trigger(current_user_query)
         handoff_just_now_requested = (
