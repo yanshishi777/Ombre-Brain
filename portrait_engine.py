@@ -3576,14 +3576,19 @@ class DailyPortraitMaintainer:
         start = text.find("{")
         if start >= 0:
             text = text[start:]
-        try:
-            parsed, _ = json.JSONDecoder().raw_decode(text)
-        except json.JSONDecodeError:
-            logger.warning("Portrait JSON parse failed: %s", str(raw)[:200])
-            raise ValueError("portrait_json_parse_failed")
-        if not isinstance(parsed, dict):
-            raise ValueError("portrait_json_not_object")
-        return parsed
+        last_error: Exception | None = None
+        # 候选序列：原始文本 -> 修复尾随逗号后的文本
+        for candidate in (text, re.sub(r",\s*([}\]])", r"\1", text)):
+            try:
+                parsed, _ = json.JSONDecoder().raw_decode(candidate)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+            last_error = ValueError("portrait_json_not_object")
+        logger.warning("Portrait JSON parse failed: %s", str(raw)[:300])
+        raise last_error or ValueError("portrait_json_parse_failed")
 
     def _normalize_evidence(
         self,
