@@ -3103,7 +3103,7 @@ class GatewayService:
                         session_id,
                         query_planner_debug.get("skip_reason") or "targeted_memory_detail_query",
                     )
-                    if just_now_context_requested and self.retrieval_mode == "bucket":
+                    if just_now_context_requested and self.recalled_budget > 0:
                         # just_now 场景：仍补一遍轻量语义召回，让"刚刚X"也能接上相关长程记忆。
                         # 不因此丢失 just_now 的短上下文（它单独注入），只是额外带相关历史。
                         stage_started_at = time.perf_counter()
