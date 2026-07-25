@@ -289,6 +289,20 @@ DATE_RECALL_ROLE_SENSITIVE_MARKERS = (
     "怎么说的",
 )
 DATE_RECALL_ROLE_QUERY_SHELL_TERMS = frozenset(DATE_RECALL_ROLE_SENSITIVE_MARKERS)
+# 泛化日期回溯：问“某天我们干了什么/发生了什么/怎么样”时，不应再套用具体主题过滤器
+# （如把“干了”当成主题），而应按日期把当天所有记忆都拉出来。
+DATE_RECALL_BROAD_QUERY_MARKERS = frozenset(
+    {
+        "什么", "怎么", "怎样", "如何", "干嘛", "干什么", "干啥", "做啥", "做什么",
+        "做了什么", "干了什么", "发生了什么", "情况", "状态", "怎么样", "怎样了",
+        "如何了", "怎么样了", "好吗", "还好吗", "开心吗", "难过吗", "累吗", "忙吗",
+        "睡了吗", "吃了吗", "吃了什么", "吃了啥", "有啥", "有哪些", "有什么",
+        "有什么事", "有什么事吗", "在干嘛", "在干什么", "在做什么", "在干啥",
+        "去干嘛", "来干嘛", "来做什么", "来干什么", "在聊什么", "说了什么",
+        "聊了什么", "提了什么", "玩什么", "做了啥", "干了啥", "弄什么", "搞什么",
+        "搞了什么", "整什么", "干嘛了", "干什么了", "聊啥", "说啥", "提啥",
+    }
+)
 MEMORY_SENTINEL_RESIDUE_STOP_TERMS = query_intent_term_set("memory_sentinel.residue_stop_terms")
 MEMORY_SENTINEL_RESIDUE_PREFIXES = query_intent_terms("memory_sentinel.residue_prefixes")
 MEMORY_SENTINEL_SKIP_ONLY_TERMS = query_intent_term_set("memory_sentinel.skip_only_terms")
@@ -8342,9 +8356,9 @@ class GatewayService:
             match_assistant_text=role_safe_transcript_required,
         )
         exact_phrase_raw_hit = bool(turns) and bool(protected_phrases)
+        # 泛化日期查询（topic_terms 为空）也应返回当天全部记忆桶，而不是只靠对话轮次。
         include_buckets = (
             (not role_safe_transcript_required)
-            and bool(topic_terms)
             and not exact_phrase_raw_hit
         )
         buckets = self._date_recall_buckets_for_date(all_buckets, date_key, topic_terms) if include_buckets else []
@@ -8596,12 +8610,34 @@ class GatewayService:
             return True
         return self._query_has_explicit_date_topic(text)
 
+    def _query_is_broad_date_recall(self, query: str) -> bool:
+        """用户只是在泛泛地问某天“干了什么/发生了什么/怎么样”，没有具体主题。"""
+        text = str(query or "").strip()
+        if not self._query_date_recall_hint(text):
+            return False
+        if any(marker in text for marker in DATE_RECALL_CHAT_MARKERS):
+            return False
+        if self._date_recall_protected_topic_terms(text):
+            return False
+        stripped = self._strip_date_recall_query_shell(text)
+        if not stripped:
+            return True
+        residue = stripped
+        for marker in sorted(DATE_RECALL_BROAD_QUERY_MARKERS, key=lambda m: len(m), reverse=True):
+            residue = residue.replace(marker, " ")
+        residue = re.sub(r"[的了着过吗呢吧啊哦呀嘛哈咯还啦呗哟额喂]", "", residue)
+        residue = re.sub(r"\s+", "", residue)
+        return not residue
+
     def _query_has_explicit_date_topic(self, query: str) -> bool:
         text = str(query or "").strip()
         hint = self._query_date_recall_hint(text)
         if not hint:
             return False
         if self._date_recall_protected_topic_terms(text):
+            return True
+        # 泛化日期查询（如“某天我们干了什么”）不套具体主题过滤器，但仍触发 date_recall。
+        if self._query_is_broad_date_recall(text):
             return True
         # 去掉日期外壳和 shell 词后，只要有实际主题词（如“歌”“音乐”“代码”），
         # 就认为用户在问“某一天的某类事”，应触发 date_recall。
@@ -8629,6 +8665,9 @@ class GatewayService:
         protected_terms = self._date_recall_protected_topic_terms(query)
         if protected_terms:
             return protected_terms
+        # 泛化日期查询不施加主题过滤，按当天全部记忆召回。
+        if self._query_is_broad_date_recall(query):
+            return []
         topic_query = self._strip_date_recall_query_shell(query)
         if not topic_query:
             return []
