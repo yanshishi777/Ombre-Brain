@@ -3420,6 +3420,120 @@ async def api_proactive_recall(request):
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
 
 
+def _extract_event_date(name: str, content: str, meta: dict) -> tuple[str | None, str]:
+    """返回 (YYYY-MM-DD 或 None, 来源标签)。
+
+    事件日期优先级：内容里首个日期 > created > last_active。
+    内容日期支持 ISO(2026-07-20)、斜杠(2026/7/20)、中文(2026年7月20日)、月日(7月20日, 取当前年)。
+    """
+    import re
+
+    text = f"{name}\n{content}"
+    iso = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", text)
+    if iso:
+        y, m, d = int(iso.group(1)), int(iso.group(2)), int(iso.group(3))
+        if 1 <= m <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{m:02d}-{d:02d}", "content"
+    cn = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", text)
+    if cn:
+        y, m, d = int(cn.group(1)), int(cn.group(2)), int(cn.group(3))
+        if 1 <= m <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{m:02d}-{d:02d}", "content"
+    md = re.search(r"(\d{1,2})月(\d{1,2})日", text)
+    if md:
+        m, d = int(md.group(1)), int(md.group(2))
+        if 1 <= m <= 12 and 1 <= d <= 31:
+            return f"{datetime.now().year:04d}-{m:02d}-{d:02d}", "content"
+    for key in ("created", "last_active"):
+        v = meta.get(key)
+        if v:
+            s = str(v)[:10]
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+                return s, key
+    return None, "none"
+
+
+@mcp.custom_route("/api/admin/migrate-backfill", methods=["POST"])
+async def api_migrate_backfill(request):
+    """遗留桶元数据回填：date(事件日期) + proactive_eligible。
+
+    鉴权：memory-write token（OMBRE_GATEWAY_TOKEN），走 raw-api auth。
+    请求体：
+      dry_run (bool, 默认 true): 只生成计划，不写库。
+      limit (int, 默认 0=不限): 实际应用时最多改 N 个桶。
+      modes (list[str], 默认 ["date","proactive"]): 回填哪些字段。
+    规则：
+      date 优先级：内容日期 > created > last_active。
+      proactive_eligible=True 仅给 type in (dynamic, permanent)，
+      排除 dont_surface / deleted_at / type==archived 的桶。
+    """
+    from starlette.responses import JSONResponse
+
+    err = _require_raw_api_auth(request)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    dry_run = _bool_value(body.get("dry_run"), True)
+    limit = _int_between(body.get("limit"), 0, 0, 2000)
+    modes = body.get("modes") or ["date", "proactive"]
+    if isinstance(modes, str):
+        modes = [modes]
+
+    all_buckets = await bucket_mgr.list_all(include_archive=True)
+    plan: list[dict] = []
+    applied_ids: list[str] = []
+    for b in all_buckets:
+        if not isinstance(b, dict):
+            continue
+        meta = b.get("metadata") if isinstance(b.get("metadata"), dict) else {}
+        bid = b.get("id")
+        if not bid:
+            continue
+        btype = meta.get("type") or b.get("type")
+        if btype == "archived":
+            continue
+        if meta.get("deleted_at"):
+            continue
+        if meta.get("dont_surface"):
+            continue
+        eligible_proactive = btype in ("dynamic", "permanent")
+        content = b.get("content") or ""
+        name = str(meta.get("name") or "")
+        date_val = None
+        date_source = "none"
+        if "date" in modes:
+            date_val, date_source = _extract_event_date(name, content, meta)
+        changes: dict = {}
+        if "date" in modes and date_val and meta.get("date") != date_val:
+            changes["date"] = date_val
+        if "proactive" in modes and eligible_proactive and meta.get("proactive_eligible") is not True:
+            changes["proactive_eligible"] = True
+        if not changes:
+            continue
+        plan.append({"id": bid, "type": btype, "changes": changes, "date_source": date_source})
+        if dry_run:
+            continue
+        if limit and len(applied_ids) >= limit:
+            continue
+        ok = await bucket_mgr.update(bid, extra_metadata=changes)
+        if ok:
+            applied_ids.append(bid)
+
+    return JSONResponse({
+        "status": "ok",
+        "dry_run": dry_run,
+        "planned": len(plan),
+        "applied": len(applied_ids),
+        "plan_sample": plan[:60],
+        "applied_ids": applied_ids,
+    })
+
+
 # =============================================================
 # /api/admin/embedding-debug: 诊断用，暴露 search_similar 原始结果
 # 仅 dashboard 鉴权可调用。
