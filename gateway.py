@@ -600,6 +600,21 @@ class GatewayService:
         self.just_now_semantic_fallback_top_k = max(
             1, min(30, int(self.gateway_cfg.get("just_now_semantic_fallback_top_k", 10)))
         )
+        # 相关性排序的时间加权：在语义分之上给「更近」的记忆小幅加分，避免
+        # 旧桶凭借略高的 embedding 相似度挤掉真正想追问的近期记忆（如 7-24 音乐桶）。
+        # 只调整排序优先级，不增加最终注入条数/预算。
+        self.recency_boost_enabled = self._bool_config_value(
+            self.gateway_cfg.get("recency_boost_enabled"), True
+        )
+        self.recency_boost_24h = self._clamp(
+            float(self.gateway_cfg.get("recency_boost_24h", 0.06)), 0.0, 0.5
+        )
+        self.recency_boost_72h = self._clamp(
+            float(self.gateway_cfg.get("recency_boost_72h", 0.03)), 0.0, 0.5
+        )
+        self.recency_boost_7d = self._clamp(
+            float(self.gateway_cfg.get("recency_boost_7d", 0.01)), 0.0, 0.5
+        )
         self.semantic_session_dedupe_enabled = self._bool_config_value(
             self.gateway_cfg.get("semantic_session_dedupe_enabled"),
             True,
@@ -920,6 +935,10 @@ class GatewayService:
                 "just_now_context_max_turns": self.just_now_context_max_turns,
                 "just_now_context_budget": self.just_now_context_budget,
                 "just_now_semantic_fallback_top_k": self.just_now_semantic_fallback_top_k,
+                "recency_boost_enabled": self.recency_boost_enabled,
+                "recency_boost_24h": self.recency_boost_24h,
+                "recency_boost_72h": self.recency_boost_72h,
+                "recency_boost_7d": self.recency_boost_7d,
                 "memory_sentinel_enabled": self.memory_sentinel_enabled,
                 "domain_sentinel_enabled": self.domain_sentinel_enabled,
                 "domain_sentinel_model": self.domain_sentinel_model,
@@ -1403,6 +1422,24 @@ class GatewayService:
             )
             self.gateway_cfg["just_now_semantic_fallback_top_k"] = self.just_now_semantic_fallback_top_k
             updated.append("gateway.just_now_semantic_fallback_top_k")
+        if "recency_boost_enabled" in payload:
+            self.recency_boost_enabled = self._bool_config_value(
+                payload["recency_boost_enabled"], self.recency_boost_enabled
+            )
+            self.gateway_cfg["recency_boost_enabled"] = self.recency_boost_enabled
+            updated.append("gateway.recency_boost_enabled")
+        if "recency_boost_24h" in payload:
+            self.recency_boost_24h = self._clamp(float(payload["recency_boost_24h"]), 0.0, 0.5)
+            self.gateway_cfg["recency_boost_24h"] = self.recency_boost_24h
+            updated.append("gateway.recency_boost_24h")
+        if "recency_boost_72h" in payload:
+            self.recency_boost_72h = self._clamp(float(payload["recency_boost_72h"]), 0.0, 0.5)
+            self.gateway_cfg["recency_boost_72h"] = self.recency_boost_72h
+            updated.append("gateway.recency_boost_72h")
+        if "recency_boost_7d" in payload:
+            self.recency_boost_7d = self._clamp(float(payload["recency_boost_7d"]), 0.0, 0.5)
+            self.gateway_cfg["recency_boost_7d"] = self.recency_boost_7d
+            updated.append("gateway.recency_boost_7d")
         if "conversation_turns_max_entries" in payload:
             self.conversation_turns_max_entries = max(0, int(payload["conversation_turns_max_entries"]))
             self.gateway_cfg["conversation_turns_max_entries"] = self.conversation_turns_max_entries
@@ -10912,24 +10949,72 @@ class GatewayService:
             return f"{first}\n{note_line}"
         return f"{first}\n{note_line}\n{rest}"
 
+    def _moment_recency_boost(self, moment: dict) -> float:
+        """给更近的记忆小幅加分，缓解「旧桶靠略高相似度挤掉新记忆」的问题。
+
+        只读 moment 里的日期/时间戳，不改动其他分数。加分阶梯：
+        - 24 小时内：+recency_boost_24h
+        - 72 小时内：+recency_boost_72h
+        - 7 天内：+recency_boost_7d
+        更旧：0。
+        """
+        if not self.recency_boost_enabled:
+            return 0.0
+        if not isinstance(moment, dict):
+            return 0.0
+        ts = None
+        for key in ("created_at", "date", "bucket_date", "bucket_updated_at", "updated_at"):
+            val = moment.get(key)
+            if val:
+                ts = self._parse_iso(val)
+                if ts:
+                    break
+        if not ts:
+            meta = moment.get("metadata", {}) if isinstance(moment.get("metadata"), dict) else {}
+            for key in ("last_active", "created", "updated_at", "date"):
+                val = meta.get(key)
+                if val:
+                    ts = self._parse_iso(val)
+                    if ts:
+                        break
+        if not ts:
+            return 0.0
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        age = now - ts
+        if age.total_seconds() < 0:
+            return 0.0
+        hours = age.total_seconds() / 3600.0
+        if hours <= 24:
+            return self.recency_boost_24h
+        if hours <= 72:
+            return self.recency_boost_72h
+        if hours <= 168:
+            return self.recency_boost_7d
+        return 0.0
+
     def _moment_relevance_score(self, moment: dict) -> float:
         """取单条召回记忆的相关性分（越高越该被注入）。
 
         just_now 兜底命中（brain embedding）的分来自 _relevance（显式写入的相似度）；
         普通召回的分来自 bucket recall_signal（semantic_score / rerank_score / score）。
         都没有时记 0，由排序把它压到末尾、被条数/预算上限自然淘汰。
+
+        最终排序分 = 基础相关性分 + 时间加权分。时间加权只提升近期记忆的优先级，
+        不增加最终注入条数/预算，仍受 recalled_moment_cap 与 recalled_memory_budget 约束。
         """
         rel = moment.get("_relevance")
         if isinstance(rel, (int, float)):
-            return float(rel)
-        return float(
-            max(
-                self._safe_float(moment.get("semantic_score"), 0.0),
-                self._safe_float(moment.get("rerank_score"), 0.0),
-                self._safe_float(moment.get("score"), 0.0),
-                0.0,
+            base = float(rel)
+        else:
+            base = float(
+                max(
+                    self._safe_float(moment.get("semantic_score"), 0.0),
+                    self._safe_float(moment.get("rerank_score"), 0.0),
+                    self._safe_float(moment.get("score"), 0.0),
+                    0.0,
+                )
             )
-        )
+        return base + self._moment_recency_boost(moment)
 
     def _rank_and_cap_recalled_moments(
         self, moments: list[dict], cap: int

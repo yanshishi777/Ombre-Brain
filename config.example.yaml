@@ -370,6 +370,12 @@ gateway:
   # 过小会截断相似度稍低但仍相关的近期记忆（如 7-24 音乐桶）；
   # 最终注入仍由 recalled_moment_cap 和 recalled_memory_budget 严格排序截断。
   just_now_semantic_fallback_top_k: 10
+  # 时间加权：在语义相关性上给更近的记忆小幅加分，避免旧桶凭略高相似度挤掉新记忆。
+  # 只影响排序，不增加最终注入条数/预算。
+  recency_boost_enabled: true
+  recency_boost_24h: 0.06
+  recency_boost_72h: 0.03
+  recency_boost_7d: 0.01
   conversation_turns_max_entries: 500
   memory_sentinel_enabled: true     # grey-zone routing: search | tone_only | skip; hard recall signals bypass it
   domain_sentinel_enabled: true      # coarse routing: message_type, primary domain, optional should_recall=false
