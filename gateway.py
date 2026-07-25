@@ -3138,6 +3138,8 @@ class GatewayService:
                             recalled_moments.append(moment)
                         moment_candidates = list(recalled_moments)
                         mark_step("just_now_dynamic_recall", stage_started_at)
+                        query_planner_debug["jn_light_recall_executed"] = True
+                        query_planner_debug["jn_light_recall_count"] = len(recalled_moments)
                     suppressed_moments = []
                     suppressed_buckets = []
                 elif self.retrieval_mode == "bucket":
