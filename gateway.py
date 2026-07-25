@@ -3104,7 +3104,10 @@ class GatewayService:
                         query_planner_debug.get("skip_reason") or "targeted_memory_detail_query",
                     )
                     if just_now_context_requested and self.recalled_budget > 0:
-                        logger.error("JN_PATCH_V3 fired budget=%s", self.recalled_budget)
+                        sq = self._dynamic_recall_search_query(
+                            current_user_query, memory_sentinel_debug
+                        )
+                        logger.error("JN_PATCH_V3 sq=%r vague=%s", sq[:60] if sq else sq, self._auto_query_too_vague(current_user_query))
                         # just_now 场景：仍补一遍轻量语义召回，让"刚刚X"也能接上相关长程记忆。
                         # 不因此丢失 just_now 的短上下文（它单独注入），只是额外带相关历史。
                         stage_started_at = time.perf_counter()
@@ -3139,6 +3142,7 @@ class GatewayService:
                             recalled_moments.append(moment)
                         moment_candidates = list(recalled_moments)
                         mark_step("just_now_dynamic_recall", stage_started_at)
+                        logger.error("JN_PATCH_V3 jn_buckets=%d recalled_moments=%d", len(jn_buckets), len(recalled_moments))
                         query_planner_debug["jn_light_recall_executed"] = True
                         query_planner_debug["jn_light_recall_count"] = len(recalled_moments)
                     suppressed_moments = []
