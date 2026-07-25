@@ -2858,7 +2858,7 @@ class GatewayService:
             self.just_now_context_enabled
             and self._query_requests_just_now_context(current_user_query)
         )
-        logger.error("JN_DBG just_now_context_requested=%s enabled=%s query=%r", just_now_context_requested, self.just_now_context_enabled, (current_user_query or "")[:60])
+        logger.error("JN_DBG just_now_context_requested=%s enabled=%s has_gang=%s cps=%s q=%r", just_now_context_requested, self.just_now_context_enabled, ("刚刚" in (current_user_query or "")), [hex(ord(c)) for c in (current_user_query or "")[:6]], (current_user_query or "")[:30])
         is_handoff_trigger_query = self._query_is_handoff_trigger(current_user_query)
         handoff_just_now_requested = (
             just_now_context_requested
