@@ -3111,8 +3111,9 @@ class GatewayService:
                             current_user_query,
                             session_id,
                             all_buckets,
-                            search_query=current_user_query,
-                            allow_query_planner=False,
+                            search_query=self._dynamic_recall_search_query(
+                                current_user_query, memory_sentinel_debug
+                            ),
                             allow_semantic_session_dedupe=False,
                         )
                         for bucket in jn_buckets:
