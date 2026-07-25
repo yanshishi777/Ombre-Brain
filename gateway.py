@@ -3112,9 +3112,7 @@ class GatewayService:
                             current_user_query,
                             session_id,
                             all_buckets,
-                            search_query=self._dynamic_recall_search_query(
-                                current_user_query, memory_sentinel_debug
-                            ),
+                            search_query=current_user_query,
                             allow_semantic_session_dedupe=False,
                         )
                         logger.error("JN_DBG just_now _select_dynamic_buckets returned %d buckets | search_query=%r", len(jn_buckets), self._dynamic_recall_search_query(current_user_query, memory_sentinel_debug))
