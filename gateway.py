@@ -613,6 +613,10 @@ class GatewayService:
         self.core_budget = int(self.gateway_cfg.get("core_memory_budget", 500))
         self.recent_budget = int(self.gateway_cfg.get("recent_context_budget", 300))
         self.recalled_budget = int(self.gateway_cfg.get("recalled_memory_budget", 900))
+        # 单次注入的长程记忆「条数」硬上限：只保留相关性最高的几条，避免无脑堆记忆。
+        # 与 recalled_budget（token/字符上限）配合形成双上限；排序在预算填充之前完成，
+        # 因此预算总是先喂给最相关的记忆，相关记忆不会被无关记忆挤掉。
+        self.recalled_moment_cap = max(1, int(self.gateway_cfg.get("recalled_moment_cap", 12)))
         self.direct_render_mode = self._normalize_direct_render_mode(
             self.gateway_cfg.get("direct_render_mode", "auto")
         )
@@ -927,6 +931,7 @@ class GatewayService:
                 "date_recall_max_turns": self.date_recall_max_turns,
                 "date_recall_max_buckets": self.date_recall_max_buckets,
                 "recalled_memory_budget": self.recalled_budget,
+                "recalled_moment_cap": self.recalled_moment_cap,
                 "related_memory_budget": self.related_memory_budget,
                 "operit_context_rewrite_enabled": self.operit_context_rewrite_enabled,
                 "semantic_candidate_top_k": self.semantic_candidate_top_k,
@@ -1004,6 +1009,7 @@ class GatewayService:
             "date_recall_max_turns": self.date_recall_max_turns,
             "date_recall_max_buckets": self.date_recall_max_buckets,
             "recalled_memory_budget": self.recalled_budget,
+            "recalled_moment_cap": self.recalled_moment_cap,
             "related_memory_budget": self.related_memory_budget,
             "operit_context_rewrite_enabled": self.operit_context_rewrite_enabled,
             "semantic_candidate_top_k": self.semantic_candidate_top_k,
@@ -2705,11 +2711,12 @@ class GatewayService:
 
     async def _just_now_brain_semantic_bucket_ids(
         self, query: str, limit: int = 5
-    ) -> list[str]:
-        """just_now 兜底：调用 brain 的 /api/semantic-buckets 取语义相关 bucket_id 列表。
+    ) -> list[tuple[str, float]]:
+        """just_now 兜底：调用 brain 的 /api/semantic-buckets 取语义相关 (bucket_id, similarity)。
 
         仅在网关自身语义召回为空时调用，避免常态额外开销。该端点为纯 embedding 检索，
-        无冷却、无 LLM 打分、无写入副作用。返回 bucket_id 字符串列表。
+        无冷却、无 LLM 打分、无写入副作用。返回 (bucket_id, 相似度) 列表，供 just_now 长程
+        召回按相关性排序、让「刚刚/上次X」真正命中的相关记忆（如音乐桶）排到最前。
         """
         if not self.remote_brain_url:
             return []
@@ -2731,14 +2738,14 @@ class GatewayService:
             return []
         if not isinstance(data, list):
             return []
-        ids: list[str] = []
+        pairs: list[tuple[str, float]] = []
         for item in data:
             if not isinstance(item, dict):
                 continue
             bid = str(item.get("bucket_id") or "")
             if bid:
-                ids.append(bid)
-        return ids
+                pairs.append((bid, self._safe_float(item.get("similarity"), 0.0)))
+        return pairs
 
     @staticmethod
     def _extract_recent_user_texts(messages: Any, limit: int = 6) -> list[str]:
@@ -3160,16 +3167,19 @@ class GatewayService:
                             allow_semantic_session_dedupe=False,
                         )
                         # 兜底：网关自身召回为空时，走 brain 语义桶检索（无冷却/无 LLM 副作用）
+                        _jn_sim_map: dict[str, float] = {}
                         if not jn_buckets:
                             try:
-                                jn_ids = await self._just_now_brain_semantic_bucket_ids(
+                                _jn_pairs = await self._just_now_brain_semantic_bucket_ids(
                                     current_user_query
                                 )
-                                if jn_ids:
+                                for _bid, _sim in _jn_pairs:
+                                    _jn_sim_map[_bid] = _sim
+                                if _jn_pairs:
                                     _have = {str(b.get("id")) for b in jn_buckets}
                                     for _b in all_buckets:
                                         _bid = str(_b.get("id") or "")
-                                        if _bid and _bid in jn_ids and _bid not in _have:
+                                        if _bid and _bid in _jn_sim_map and _bid not in _have:
                                             jn_buckets.append(_b)
                                             _have.add(_bid)
                             except Exception as _rf:
@@ -3183,6 +3193,17 @@ class GatewayService:
                                 if isinstance(bucket.get("_recall_signal"), dict)
                                 else {}
                             )
+                            # 相关性：brain 兜底命中用 embedding 相似度（音乐桶等高）；
+                            # 网关 lexical 命中用其 recall_signal 分数。两者都缺则 0（排序垫底）。
+                            if bucket_id in _jn_sim_map:
+                                _relevance = _jn_sim_map[bucket_id]
+                            else:
+                                _relevance = float(max(
+                                    self._safe_float(signal.get("semantic_score"), 0.0),
+                                    self._safe_float(signal.get("rerank_score"), 0.0),
+                                    self._safe_float(signal.get("score"), 0.0),
+                                    0.0,
+                                ))
                             bucket_moments = self._direct_moments_for_bucket(bucket, current_user_query)
                             moment = self._representative_moment(bucket_moments)
                             if not moment:
@@ -3192,6 +3213,7 @@ class GatewayService:
                             if not moment:
                                 continue
                             moment = self._moment_with_bucket_recall_signal(moment, signal)
+                            moment["_relevance"] = _relevance
                             grouped_moments[bucket_id] = bucket_moments
                             recalled_moments.append(moment)
                         moment_candidates = list(recalled_moments)
@@ -3269,6 +3291,13 @@ class GatewayService:
             else:
                 suppressed_moments = []
                 suppressed_buckets = []
+            # 统一排序 + 硬条数上限：在预算填充之前完成。最相关的记忆（含 just_now/brain
+            # 语义兜底命中的音乐桶）排到最前，预算总是先喂它们；无关记忆排末尾被自然截断。
+            # 这是「音乐桶被挤掉」的根治手段——靠排序而非堆预算。
+            recalled_moments = self._rank_and_cap_recalled_moments(
+                recalled_moments, cap=self.recalled_moment_cap
+            )
+            moment_candidates = list(recalled_moments)
             stage_started_at = time.perf_counter()
             recalled_memory = await self._format_recalled_moments(
                 recalled_moments,
@@ -10830,6 +10859,45 @@ class GatewayService:
         if not sep:
             return f"{first}\n{note_line}"
         return f"{first}\n{note_line}\n{rest}"
+
+    def _moment_relevance_score(self, moment: dict) -> float:
+        """取单条召回记忆的相关性分（越高越该被注入）。
+
+        just_now 兜底命中（brain embedding）的分来自 _relevance（显式写入的相似度）；
+        普通召回的分来自 bucket recall_signal（semantic_score / rerank_score / score）。
+        都没有时记 0，由排序把它压到末尾、被条数/预算上限自然淘汰。
+        """
+        rel = moment.get("_relevance")
+        if isinstance(rel, (int, float)):
+            return float(rel)
+        return float(
+            max(
+                self._safe_float(moment.get("semantic_score"), 0.0),
+                self._safe_float(moment.get("rerank_score"), 0.0),
+                self._safe_float(moment.get("score"), 0.0),
+                0.0,
+            )
+        )
+
+    def _rank_and_cap_recalled_moments(
+        self, moments: list[dict], cap: int
+    ) -> list[dict]:
+        """统一按相关性降序排序，并施加硬条数上限。
+
+        关键设计（对应「音乐桶被挤掉」问题）：
+        - 排序在「预算填充」之前完成，因此 _format_recalled_moments 总是从最相关的记忆
+          开始填预算；无关的噪音桶排在后面，被预算/条数上限自然截断，而不可能反过来挤掉
+          相关记忆。
+        - 不靠堆大 recalled_budget 来「保险」——容量不是解法，排序才是。
+        - 相关性相同时保持原顺序（稳定排序），避免每轮抖动。
+        """
+        if not moments:
+            return []
+        scored = [(self._moment_relevance_score(m), m) for m in moments]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        if cap and cap > 0:
+            scored = scored[:cap]
+        return [m for _, m in scored]
 
     async def _format_recalled_moments(
         self,
