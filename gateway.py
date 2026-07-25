@@ -594,6 +594,12 @@ class GatewayService:
         self.proactive_max_candidates = max(1, int(_proactive_cfg.get("max_candidates", 30)))
         self.proactive_max_results = max(1, int(_proactive_cfg.get("max_results", 3)))
         self.proactive_budget_chars = max(0, int(_proactive_cfg.get("budget_chars", 600)))
+        # just_now 兜底语义召回候选池：limit 过小会把相似度稍低但仍相关的近期记忆
+        # （如 7-24 音乐桶）截在候选池外，导致只召回 7-20 的旧记忆。扩大候选池但不
+        # 扩大最终注入条数上限，仍由 _rank_and_cap_recalled_moments 严格排序截断。
+        self.just_now_semantic_fallback_top_k = max(
+            1, min(30, int(self.gateway_cfg.get("just_now_semantic_fallback_top_k", 10)))
+        )
         self.semantic_session_dedupe_enabled = self._bool_config_value(
             self.gateway_cfg.get("semantic_session_dedupe_enabled"),
             True,
@@ -913,6 +919,7 @@ class GatewayService:
                 "just_now_context_hours": self.just_now_context_hours,
                 "just_now_context_max_turns": self.just_now_context_max_turns,
                 "just_now_context_budget": self.just_now_context_budget,
+                "just_now_semantic_fallback_top_k": self.just_now_semantic_fallback_top_k,
                 "memory_sentinel_enabled": self.memory_sentinel_enabled,
                 "domain_sentinel_enabled": self.domain_sentinel_enabled,
                 "domain_sentinel_model": self.domain_sentinel_model,
@@ -933,6 +940,12 @@ class GatewayService:
                 "recalled_memory_budget": self.recalled_budget,
                 "recalled_moment_cap": self.recalled_moment_cap,
                 "related_memory_budget": self.related_memory_budget,
+                "proactive_recall": {
+                    "enabled": self.proactive_recall_enabled,
+                    "score_threshold": self.proactive_score_threshold,
+                    "similarity_threshold": self.proactive_similarity_threshold,
+                    "max_results": self.proactive_max_results,
+                },
                 "operit_context_rewrite_enabled": self.operit_context_rewrite_enabled,
                 "semantic_candidate_top_k": self.semantic_candidate_top_k,
                 "moment_search_limit": self.moment_search_limit,
@@ -989,6 +1002,7 @@ class GatewayService:
             "just_now_context_hours": self.just_now_context_hours,
             "just_now_context_max_turns": self.just_now_context_max_turns,
             "just_now_context_budget": self.just_now_context_budget,
+            "just_now_semantic_fallback_top_k": self.just_now_semantic_fallback_top_k,
             "conversation_turns_max_entries": self.conversation_turns_max_entries,
             "memory_sentinel_enabled": self.memory_sentinel_enabled,
             "domain_sentinel_enabled": self.domain_sentinel_enabled,
@@ -1011,6 +1025,12 @@ class GatewayService:
             "recalled_memory_budget": self.recalled_budget,
             "recalled_moment_cap": self.recalled_moment_cap,
             "related_memory_budget": self.related_memory_budget,
+            "proactive_recall": {
+                "enabled": self.proactive_recall_enabled,
+                "score_threshold": self.proactive_score_threshold,
+                "similarity_threshold": self.proactive_similarity_threshold,
+                "max_results": self.proactive_max_results,
+            },
             "operit_context_rewrite_enabled": self.operit_context_rewrite_enabled,
             "semantic_candidate_top_k": self.semantic_candidate_top_k,
             "moment_search_limit": self.moment_search_limit,
@@ -1283,6 +1303,31 @@ class GatewayService:
 
     def _apply_gateway_memory_config(self, payload: dict[str, Any]) -> list[str]:
         updated: list[str] = []
+        if "proactive_recall" in payload:
+            _pc = payload["proactive_recall"]
+            if isinstance(_pc, dict):
+                _base = self.gateway_cfg.get("proactive_recall", {}) or {}
+                if "enabled" in _pc:
+                    self.proactive_recall_enabled = self._bool_config_value(
+                        _pc["enabled"], self.proactive_recall_enabled
+                    )
+                    _base["enabled"] = self.proactive_recall_enabled
+                    updated.append("gateway.proactive_recall.enabled")
+                if "score_threshold" in _pc:
+                    self.proactive_score_threshold = float(_pc["score_threshold"])
+                    _base["score_threshold"] = self.proactive_score_threshold
+                    updated.append("gateway.proactive_recall.score_threshold")
+                if "similarity_threshold" in _pc:
+                    self.proactive_similarity_threshold = self._clamp(
+                        float(_pc["similarity_threshold"]), 0.0, 1.0
+                    )
+                    _base["similarity_threshold"] = self.proactive_similarity_threshold
+                    updated.append("gateway.proactive_recall.similarity_threshold")
+                if "max_results" in _pc:
+                    self.proactive_max_results = max(1, int(_pc["max_results"]))
+                    _base["max_results"] = self.proactive_max_results
+                    updated.append("gateway.proactive_recall.max_results")
+                self.gateway_cfg["proactive_recall"] = _base
         if "upstreams" in payload:
             updated.extend(self._apply_gateway_upstreams_config(payload["upstreams"]))
         if "cooldown_hours" in payload:
@@ -1352,6 +1397,12 @@ class GatewayService:
             self.just_now_context_budget = max(0, int(payload["just_now_context_budget"]))
             self.gateway_cfg["just_now_context_budget"] = self.just_now_context_budget
             updated.append("gateway.just_now_context_budget")
+        if "just_now_semantic_fallback_top_k" in payload:
+            self.just_now_semantic_fallback_top_k = max(
+                1, min(30, int(payload["just_now_semantic_fallback_top_k"]))
+            )
+            self.gateway_cfg["just_now_semantic_fallback_top_k"] = self.just_now_semantic_fallback_top_k
+            updated.append("gateway.just_now_semantic_fallback_top_k")
         if "conversation_turns_max_entries" in payload:
             self.conversation_turns_max_entries = max(0, int(payload["conversation_turns_max_entries"]))
             self.gateway_cfg["conversation_turns_max_entries"] = self.conversation_turns_max_entries
@@ -2710,7 +2761,7 @@ class GatewayService:
         return joined
 
     async def _just_now_brain_semantic_bucket_ids(
-        self, query: str, limit: int = 5
+        self, query: str, limit: int | None = None
     ) -> list[tuple[str, float]]:
         """just_now 兜底：调用 brain 的 /api/semantic-buckets 取语义相关 (bucket_id, similarity)。
 
@@ -2723,10 +2774,11 @@ class GatewayService:
         if not query or not query.strip():
             return []
         url = f"{self.remote_brain_url.rstrip('/')}/api/semantic-buckets"
+        top_k = max(1, min(30, int(limit) if limit is not None else self.just_now_semantic_fallback_top_k))
         try:
             resp = await self.http_client.get(
                 url,
-                params={"q": query, "limit": limit, "min_similarity": 0.3},
+                params={"q": query, "limit": top_k, "min_similarity": 0.3},
                 timeout=30.0,
             )
             if resp.status_code != 200:

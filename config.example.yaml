@@ -366,6 +366,10 @@ gateway:
   just_now_context_hours: 6
   just_now_context_max_turns: 5
   just_now_context_budget: 420
+  # just_now 本地语义召回为空时，向 brain /api/semantic-buckets 兜底的候选池大小。
+  # 过小会截断相似度稍低但仍相关的近期记忆（如 7-24 音乐桶）；
+  # 最终注入仍由 recalled_moment_cap 和 recalled_memory_budget 严格排序截断。
+  just_now_semantic_fallback_top_k: 10
   conversation_turns_max_entries: 500
   memory_sentinel_enabled: true     # grey-zone routing: search | tone_only | skip; hard recall signals bypass it
   domain_sentinel_enabled: true      # coarse routing: message_type, primary domain, optional should_recall=false
