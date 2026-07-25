@@ -18338,12 +18338,14 @@ class GatewayService:
         dynamic_context = "\n".join(dynamic_sections).strip()
         stable_tokens = count_tokens_approx(stable_context)
         dynamic_tokens = count_tokens_approx(dynamic_context)
-        if stable_tokens + dynamic_tokens <= self.inject_total_budget:
+        # stable（人设/核心规则）是必须注入的固定前缀，永远保留，不参与总预算的截断。
+        # inject_total_budget 作为「动态部分」的软上限：动态超了就从最不相关的尾部裁掉，
+        # 而排在最前、最相关的 recalled_memory（如音乐桶）因此得以保留。
+        # 旧逻辑在 stable_tokens >= 总预算时会把整段动态记忆清零，导致排好序的相关记忆
+        # 永远进不了转发消息——这正是「音乐桶被挤掉 / 模型只能调 breath」的根因。
+        if dynamic_tokens <= self.inject_total_budget:
             return stable_context, dynamic_context
-        if stable_tokens >= self.inject_total_budget:
-            return self._trim_text(stable_context, self.inject_total_budget), ""
-        remaining = max(0, self.inject_total_budget - stable_tokens)
-        return stable_context, self._trim_text(dynamic_context, remaining)
+        return stable_context, self._trim_text(dynamic_context, self.inject_total_budget)
 
     @staticmethod
     def _memory_reading_policy_context() -> str:
