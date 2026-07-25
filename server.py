@@ -11697,6 +11697,58 @@ async def api_search(request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@mcp.custom_route("/api/semantic-buckets", methods=["GET"])
+async def api_semantic_buckets(request):
+    """纯语义桶检索（embedding 余弦相似），无冷却、无 LLM 打分、无写入副作用。
+
+    供 gateway 在自身语义召回缺失（如音乐类查询）时兜底使用。
+    返回 JSON 数组：[{bucket_id, similarity, name, type}]，按相似度降序。
+    """
+    from starlette.responses import JSONResponse
+
+    query = (request.query_params.get("q") or "").strip()
+    if not query:
+        return JSONResponse({"error": "missing q parameter"}, status_code=400)
+    try:
+        limit = max(1, min(30, int(request.query_params.get("limit", "10"))))
+    except (TypeError, ValueError):
+        limit = 10
+    try:
+        min_similarity = float(request.query_params.get("min_similarity", "0.0"))
+    except (TypeError, ValueError):
+        min_similarity = 0.0
+    if not getattr(embedding_engine, "enabled", False):
+        return JSONResponse([])
+    try:
+        results = await embedding_engine.search_similar(query, top_k=limit)
+        if not results:
+            return JSONResponse([])
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        meta_by_id = {
+            str(b.get("id") or ""): (b.get("metadata") or {})
+            for b in all_buckets
+            if isinstance(b, dict) and b.get("id")
+        }
+        out = []
+        for bucket_id, sim in results:
+            bid = str(bucket_id or "")
+            if not bid:
+                continue
+            if sim < min_similarity:
+                continue
+            meta = meta_by_id.get(bid, {})
+            out.append({
+                "bucket_id": bid,
+                "similarity": round(float(sim), 4),
+                "name": meta.get("name", bid),
+                "type": meta.get("type", "dynamic"),
+            })
+        return JSONResponse(out)
+    except Exception as e:
+        logger.warning("semantic-buckets search failed: %s", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 def _raw_ingest_events_from_body(
     body: dict,
     *,

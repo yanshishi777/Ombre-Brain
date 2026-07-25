@@ -2703,6 +2703,43 @@ class GatewayService:
             joined = joined[: self.proactive_budget_chars] + "…"
         return joined
 
+    async def _just_now_brain_semantic_bucket_ids(
+        self, query: str, limit: int = 5
+    ) -> list[str]:
+        """just_now 兜底：调用 brain 的 /api/semantic-buckets 取语义相关 bucket_id 列表。
+
+        仅在网关自身语义召回为空时调用，避免常态额外开销。该端点为纯 embedding 检索，
+        无冷却、无 LLM 打分、无写入副作用。返回 bucket_id 字符串列表。
+        """
+        if not self.remote_brain_url:
+            return []
+        if not query or not query.strip():
+            return []
+        url = f"{self.remote_brain_url.rstrip('/')}/api/semantic-buckets"
+        try:
+            resp = await self.http_client.get(
+                url,
+                params={"q": query, "limit": limit, "min_similarity": 0.3},
+                timeout=30.0,
+            )
+            if resp.status_code != 200:
+                logger.warning("just_now semantic-buckets non-200 | status=%s", resp.status_code)
+                return []
+            data = resp.json()
+        except Exception as exc:
+            logger.warning("just_now brain semantic-buckets request failed: %s", exc)
+            return []
+        if not isinstance(data, list):
+            return []
+        ids: list[str] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            bid = str(item.get("bucket_id") or "")
+            if bid:
+                ids.append(bid)
+        return ids
+
     @staticmethod
     def _extract_recent_user_texts(messages: Any, limit: int = 6) -> list[str]:
         texts: list[str] = []
@@ -3105,9 +3142,9 @@ class GatewayService:
                     )
                     if just_now_context_requested and self.recalled_budget > 0:
                         # just_now 场景：补一遍轻量召回，让"刚刚X"也能接上相关长程记忆。
-                        # 主路径：语义召回；兜底：最近 just_now_context_hours 内活跃的动态桶。
-                        # "刚刚"的真实语义是"最近活跃"，而非脆弱的语义匹配——例如音乐类查询
-                        # 网关语义召回常匹配不到，但刚听的音乐桶必然落在最近活跃窗口内。
+                        # 主路径：网关自身检索（lexical/word_map）；兜底：brain 的纯 embedding
+                        # 语义检索。网关本地无 embedding 索引（未配置 embedding key），音乐类等
+                        # 语义查询自身召回常为 0，此时走 brain 的 /api/semantic-buckets 兜底。
                         stage_started_at = time.perf_counter()
                         jn_buckets, _ = await self._select_dynamic_buckets(
                             current_user_query,
@@ -3116,25 +3153,21 @@ class GatewayService:
                             search_query=current_user_query,
                             allow_semantic_session_dedupe=False,
                         )
-                        # recency fallback：把最近活跃的动态桶也带出来（保证"刚刚X"接得上）
-                        try:
-                            _now_utc = datetime.now(timezone.utc)
-                            _cutoff = _now_utc.timestamp() - self.just_now_context_hours * 3600
-                            _already = {str(b.get("id")) for b in jn_buckets}
-                            for _b in all_buckets:
-                                if _b.get("type") != "dynamic":
-                                    continue
-                                _bid = str(_b.get("id") or "")
-                                if not _bid or _bid in _already:
-                                    continue
-                                _la = self._parse_iso((_b.get("metadata") or {}).get("last_active"))
-                                if _la is None:
-                                    continue
-                                if _la.replace(tzinfo=timezone.utc).timestamp() >= _cutoff:
-                                    jn_buckets.append(_b)
-                                    _already.add(_bid)
-                        except Exception as _rf:
-                            logger.warning("just_now recency fallback failed: %s", _rf)
+                        # 兜底：网关自身召回为空时，走 brain 语义桶检索（无冷却/无 LLM 副作用）
+                        if not jn_buckets:
+                            try:
+                                jn_ids = await self._just_now_brain_semantic_bucket_ids(
+                                    current_user_query
+                                )
+                                if jn_ids:
+                                    _have = {str(b.get("id")) for b in jn_buckets}
+                                    for _b in all_buckets:
+                                        _bid = str(_b.get("id") or "")
+                                        if _bid and _bid in jn_ids and _bid not in _have:
+                                            jn_buckets.append(_b)
+                                            _have.add(_bid)
+                            except Exception as _rf:
+                                logger.warning("just_now brain semantic fallback failed: %s", _rf)
                         for bucket in jn_buckets:
                             bucket_id = str(bucket.get("id") or "")
                             if not bucket_id:
