@@ -2858,7 +2858,6 @@ class GatewayService:
             self.just_now_context_enabled
             and self._query_requests_just_now_context(current_user_query)
         )
-        logger.error("JN_DBG just_now_context_requested=%s enabled=%s has_gang=%s cps=%s q=%r", just_now_context_requested, self.just_now_context_enabled, ("刚刚" in (current_user_query or "")), [hex(ord(c)) for c in (current_user_query or "")[:6]], (current_user_query or "")[:30])
         is_handoff_trigger_query = self._query_is_handoff_trigger(current_user_query)
         handoff_just_now_requested = (
             just_now_context_requested
@@ -3105,8 +3104,10 @@ class GatewayService:
                         query_planner_debug.get("skip_reason") or "targeted_memory_detail_query",
                     )
                     if just_now_context_requested and self.recalled_budget > 0:
-                        # just_now 场景：仍补一遍轻量语义召回，让"刚刚X"也能接上相关长程记忆。
-                        # 不因此丢失 just_now 的短上下文（它单独注入），只是额外带相关历史。
+                        # just_now 场景：补一遍轻量召回，让"刚刚X"也能接上相关长程记忆。
+                        # 主路径：语义召回；兜底：最近 just_now_context_hours 内活跃的动态桶。
+                        # "刚刚"的真实语义是"最近活跃"，而非脆弱的语义匹配——例如音乐类查询
+                        # 网关语义召回常匹配不到，但刚听的音乐桶必然落在最近活跃窗口内。
                         stage_started_at = time.perf_counter()
                         jn_buckets, _ = await self._select_dynamic_buckets(
                             current_user_query,
@@ -3115,7 +3116,25 @@ class GatewayService:
                             search_query=current_user_query,
                             allow_semantic_session_dedupe=False,
                         )
-                        logger.error("JN_DBG just_now _select_dynamic_buckets returned %d buckets | search_query=%r", len(jn_buckets), self._dynamic_recall_search_query(current_user_query, memory_sentinel_debug))
+                        # recency fallback：把最近活跃的动态桶也带出来（保证"刚刚X"接得上）
+                        try:
+                            _now_utc = datetime.now(timezone.utc)
+                            _cutoff = _now_utc.timestamp() - self.just_now_context_hours * 3600
+                            _already = {str(b.get("id")) for b in jn_buckets}
+                            for _b in all_buckets:
+                                if _b.get("type") != "dynamic":
+                                    continue
+                                _bid = str(_b.get("id") or "")
+                                if not _bid or _bid in _already:
+                                    continue
+                                _la = self._parse_iso((_b.get("metadata") or {}).get("last_active"))
+                                if _la is None:
+                                    continue
+                                if _la.replace(tzinfo=timezone.utc).timestamp() >= _cutoff:
+                                    jn_buckets.append(_b)
+                                    _already.add(_bid)
+                        except Exception as _rf:
+                            logger.warning("just_now recency fallback failed: %s", _rf)
                         for bucket in jn_buckets:
                             bucket_id = str(bucket.get("id") or "")
                             if not bucket_id:
