@@ -890,6 +890,7 @@ class GatewayService:
         stats = await self.bucket_mgr.get_stats()
         return {
             "status": "ok",
+            "deploy_tag": "JUSTNOW_V5_2026_07_25_0241",
             "gateway": {
                 "token_configured": bool(self.gateway_token),
                 "upstream_ready": bool(self.upstreams) and all(
