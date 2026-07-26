@@ -365,7 +365,7 @@ gateway:
   just_now_context_enabled: true     # 刚刚/刚才/上一句: use short-term conversation_turns, not long-term memory
   just_now_context_hours: 6
   just_now_context_max_turns: 5
-  just_now_context_budget: 420
+  just_now_context_budget: 800
   # just_now 本地语义召回为空时，向 brain /api/semantic-buckets 兜底的候选池大小。
   # 过小会截断相似度稍低但仍相关的近期记忆（如 7-24 音乐桶）；
   # 最终注入仍由 recalled_moment_cap 和 recalled_memory_budget 严格排序截断。

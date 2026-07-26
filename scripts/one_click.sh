@@ -516,7 +516,7 @@ gateway:
   just_now_context_enabled: true
   just_now_context_hours: 6
   just_now_context_max_turns: 5
-  just_now_context_budget: 420
+  just_now_context_budget: 800
   conversation_turns_max_entries: 500
   date_persona_trace_enabled: true
   date_persona_trace_budget: 220

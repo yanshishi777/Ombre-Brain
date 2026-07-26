@@ -559,7 +559,7 @@ class GatewayService:
             1,
             min(8, int(self.gateway_cfg.get("just_now_context_max_turns", 5))),
         )
-        self.just_now_context_budget = max(0, int(self.gateway_cfg.get("just_now_context_budget", 420)))
+        self.just_now_context_budget = max(0, int(self.gateway_cfg.get("just_now_context_budget", 800)))
         self.conversation_turns_max_entries = max(
             0,
             int(self.gateway_cfg.get("conversation_turns_max_entries", 500)),
@@ -3779,13 +3779,70 @@ class GatewayService:
         route = self._resolve_upstream_for_model(model)
         upstream = route["upstream"]
         strategy = str(upstream.get("prompt_cache") or "").strip().lower()
-        if strategy != "openai":
-            return
 
-        payload.setdefault("prompt_cache_key", session_id)
-        retention = str(upstream.get("prompt_cache_retention") or "").strip()
-        if retention:
-            payload.setdefault("prompt_cache_retention", retention)
+        # OpenAI-native session-key cache (honoured by OpenAI models and some relays).
+        # Gated by the explicit `prompt_cache: openai` setting.
+        if strategy == "openai":
+            payload.setdefault("prompt_cache_key", session_id)
+            retention = str(upstream.get("prompt_cache_retention") or "").strip()
+            if retention:
+                payload.setdefault("prompt_cache_retention", retention)
+
+        # Claude-family models routed through an OpenAI-compatible relay need
+        # Anthropic-style `cache_control` breakpoints to actually build/read a prefix
+        # cache. This is purely beneficial (the relay ignores `cache_control` for
+        # non-Claude models) and is enabled by default for Claude models regardless of
+        # the gateway-level `prompt_cache` switch, so it survives config resets on
+        # redeploy. Non-Claude models are skipped by `_model_is_claude`.
+        if self._model_is_claude(model):
+            payload.setdefault("prompt_cache_key", session_id)
+            self._inject_openai_claude_cache_control(payload, upstream)
+
+    @staticmethod
+    def _model_is_claude(model: str) -> bool:
+        lowered = str(model or "").lower()
+        return any(token in lowered for token in ("claude", "opus", "sonnet", "haiku"))
+
+    def _inject_openai_claude_cache_control(
+        self, payload: dict[str, Any], upstream: dict[str, Any]
+    ) -> None:
+        cache_control = self._anthropic_cache_control(upstream)
+        messages = payload.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return
+        # 1) Stable system prompt -> biggest, most reusable cache segment.
+        for message in messages:
+            if isinstance(message, dict) and message.get("role") == "system":
+                self._attach_cache_control_to_openai_content(message, cache_control)
+                break
+        # 2) Last message -> lets each turn read the cache built by the previous turn.
+        self._attach_cache_control_to_openai_content(messages[-1], cache_control)
+        # 3) Top-level `system` field (if the caller separated it out).
+        if isinstance(payload.get("system"), str) and payload["system"].strip():
+            payload["system"] = [
+                {"type": "text", "text": payload["system"], "cache_control": deepcopy(cache_control)}
+            ]
+
+    @staticmethod
+    def _attach_cache_control_to_openai_content(
+        message: dict[str, Any], cache_control: dict[str, str]
+    ) -> bool:
+        if not isinstance(message, dict):
+            return False
+        content = message.get("content")
+        if isinstance(content, str):
+            if not content.strip():
+                return False
+            message["content"] = [
+                {"type": "text", "text": content, "cache_control": deepcopy(cache_control)}
+            ]
+            return True
+        if isinstance(content, list):
+            for block in reversed(content):
+                if isinstance(block, dict) and block.get("type") in {"text", "image", "document", "tool_result"}:
+                    block["cache_control"] = deepcopy(cache_control)
+                    return True
+        return False
 
     def _client_label_from_request(self, request: Request, route: str) -> str:
         explicit = (
