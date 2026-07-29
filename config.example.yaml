@@ -348,6 +348,28 @@ gateway:
       models:
         - id: "claude-opus-4-6-thinking"
           upstream_model: "[Kiro次] claude-opus-4-6-thinking [不补]"
+        - id: "claude-opus-5"
+          upstream_model: "[Kiro次] claude-opus-5 [不补]"
+        - id: "claude-sonnet-5"
+          upstream_model: "[Kiro次] claude-sonnet-5 [不补]"
+    - name: "hajiyu"
+      protocol: "openai"
+      base_url: "https://api.qwecc.icu/v1"
+      api_key_env: "OMBRE_GATEWAY_HAJIYU_API_KEY"
+      default_model: "hajiyu-opus-4-6"
+      prompt_cache: ""
+      models:
+        - id: "hajiyu-opus-4-6"
+          upstream_model: "[特特价次kiro]claude-opus-4-6"
+    - name: "juzi"
+      protocol: "openai"
+      base_url: "https://juziqishui.net/v1"
+      api_key_env: "OMBRE_GATEWAY_JUZI_API_KEY"
+      default_model: "juzi-opus-4-6-thinking"
+      prompt_cache: ""
+      models:
+        - id: "juzi-opus-4-6-thinking"
+          upstream_model: "[金汤力]claude-opus-4-6-thinking"
   head_recent_hours: 72
   recent_context_reentry_idle_hours: 24
   recent_context_cooldown_hours: 6
