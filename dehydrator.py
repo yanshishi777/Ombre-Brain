@@ -343,14 +343,14 @@ class Dehydrator:
     # API only (no local fallback)
     # 仅通过 API 脱水（无本地回退）
     # ---------------------------------------------------------
-    async def dehydrate(self, content: str, metadata: dict = None) -> str:
+    async def dehydrate(self, content: str, metadata: dict = None, *, format: bool = True) -> str:
         """
         Dehydrate/compress memory content.
-        Returns formatted summary string ready for Claude context injection.
-        Uses SQLite cache to avoid redundant API calls.
+        Returns summary string ready for Claude context injection.
         对记忆内容做脱水压缩。
-        返回格式化的摘要字符串，可直接注入 Claude 上下文。
-        使用 SQLite 缓存避免重复调用 API。
+        format: 是否用 _format_output 包一层展示 header（📌 记忆桶...）。
+                存储路径（写回桶 content）应传 format=False，避免把展示层
+                冗余标签写进记忆正文；召回/展示路径保持默认 format=True。
         """
         if not content or not content.strip():
             return "（空记忆 / empty memory）"
@@ -358,13 +358,13 @@ class Dehydrator:
         # --- Content is short enough, no compression needed ---
         # --- 内容已经很短，不需要压缩 ---
         if count_tokens_approx(content) < 100:
-            return self._format_output(content, metadata)
+            return content if not format else self._format_output(content, metadata)
 
         # --- Check cache first ---
         # --- 先查缓存 ---
         cached = self._get_cached_summary(content)
         if cached:
-            return self._format_output(cached, metadata)
+            return cached if not format else self._format_output(cached, metadata)
 
         # --- API dehydration (no local fallback) ---
         # --- API 脱水（无本地降级）---
@@ -374,7 +374,7 @@ class Dehydrator:
         result = await self._api_dehydrate(content)
         # --- Cache the result ---
         self._set_cached_summary(content, result)
-        return self._format_output(result, metadata)
+        return result if not format else self._format_output(result, metadata)
 
     async def dehydrate_direct_capsule(self, content: str, metadata: dict = None) -> str:
         """

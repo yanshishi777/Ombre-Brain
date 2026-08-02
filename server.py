@@ -797,7 +797,7 @@ _dashboard_sessions: dict[str, float] = {}
 
 def _dashboard_auth_file() -> str:
     state_dir = config.get("state_dir") or os.path.join(
-        os.path.dirname(os.path.abspath(config.get("buckets_dir", "buckets"))),
+        os.path.abspath(config.get("buckets_dir", "buckets")),
         "state",
     )
     return os.path.join(state_dir, ".dashboard_auth.json")
@@ -3861,7 +3861,7 @@ async def run_delayed_dehydration(
             continue
         try:
             summary = await dehydrator.dehydrate(
-                content, {k: v for k, v in meta.items() if k != "tags"}
+                content, {k: v for k, v in meta.items() if k != "tags"}, format=False
             )
         except Exception as e:
             processed.append({"id": bucket_id, "status": "dehydrate_failed", "error": str(e)})
@@ -3916,6 +3916,65 @@ async def api_delayed_dehydrate(request):
             freshness_days=freshness_days,
             limit=limit,
         )
+        return Response(_json.dumps(result, ensure_ascii=False, default=str), media_type="application/json")
+    except Exception as e:
+        return Response(_json.dumps({"error": str(e)}), media_type="application/json", status_code=500)
+
+
+async def run_fix_formatted_buckets(dry_run: bool = True) -> dict:
+    """一次性修复：把被 _format_output 加过 📌 header 的存量 dehydrated 桶还原。
+    - 短桶（token<100）且有 raw_content 备份：content 完整还原为 raw_content（恢复 wikilink 等）。
+    - 长桶：仅去掉首行 📌 header，保留脱水摘要。
+    仅处理 content 以「📌 记忆桶」开头的桶，不动正常的脱水摘要。
+    """
+    import re as _re
+    all_buckets = await bucket_mgr.list_all(include_archive=True)
+    fixed = []
+    for b in all_buckets:
+        meta = b.get("metadata", {}) or {}
+        if meta.get("dehydration_state") != "dehydrated":
+            continue
+        content = b.get("content", "") or ""
+        if not content.startswith("📌 记忆桶"):
+            continue
+        bucket_id = b["id"]
+        raw = b.get("raw_content", "") or ""
+        tok = count_tokens_approx(content)
+        if tok < 100 and raw:
+            new_content = raw
+            mode = "restore_short"
+        else:
+            new_content = _re.sub(r"^📌 记忆桶[^\n]*\n?", "", content)
+            mode = "strip_header_long"
+        if new_content == content:
+            continue
+        if dry_run:
+            fixed.append({"id": bucket_id, "mode": mode, "status": "dry_run"})
+            continue
+        await bucket_mgr.update(bucket_id, content=new_content)
+        fixed.append({"id": bucket_id, "mode": mode, "status": "fixed", "new_len": len(new_content)})
+    return {"scanned": len(all_buckets), "fixed": fixed, "dry_run": dry_run}
+
+
+@mcp.custom_route("/api/fix-formatted-buckets", methods=["POST"])
+async def api_fix_formatted_buckets(request):
+    """一次性修复被 _format_output 冗余标签污染的存量桶。请求体：{"dry_run": true}。"""
+    import json as _json
+    import os
+    from starlette.responses import Response
+
+    try:
+        auth = request.headers.get("authorization", "")
+        expected = os.environ.get("OMBRE_DEHYDRATION_TOKEN") or os.environ.get("OMBRE_GATEWAY_TOKEN", "")
+        if expected and auth != f"Bearer {expected}":
+            return Response(_json.dumps({"error": "unauthorized"}), media_type="application/json", status_code=401)
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        dry_run = bool(body.get("dry_run", True))
+        result = await run_fix_formatted_buckets(dry_run=dry_run)
         return Response(_json.dumps(result, ensure_ascii=False, default=str), media_type="application/json")
     except Exception as e:
         return Response(_json.dumps({"error": str(e)}), media_type="application/json", status_code=500)
@@ -9537,7 +9596,7 @@ async def trace(
     date: str = "",
     delete: bool = False,
 ) -> str:
-    """修改已有记忆，不创建新桶。tags/domain/content 是替换；date 可改事件日期；改前先 read_bucket。resolved/digested 让旧事沉底。只改元数据/date 不重建 embedding，改 content/name 才重建。"""
+    """修改已有记忆，不创建新桶。tags/domain/content 是替换；date 可改事件日期；pinned=0 会完整移回 dynamic；改前先 read_bucket。resolved/digested 让旧事沉底。只改元数据/date 不重建 embedding，改 content/name 才重建。"""
 
     bucket_id = _coerce_memory_id(bucket_id)
     if not bucket_id:
@@ -9576,6 +9635,10 @@ async def trace(
         updates["pinned"] = bool(pinned)
         if pinned == 1:
             updates["importance"] = 10  # pinned → lock importance
+        else:
+            if bucket.get("metadata", {}).get("protected"):
+                return "受保护记忆不能取消固定。"
+            updates["importance"] = 5  # full unpin → normal dynamic importance
     if anchor in (0, 1):
         if anchor == 1:
             ok, message = await _can_mark_anchor(bucket_id, bucket)
@@ -11574,7 +11637,7 @@ async def api_bucket_update(request):
     """Update dashboard-editable bucket body fields."""
     from starlette.responses import JSONResponse
 
-    err = _require_dashboard_auth(request)
+    err = _require_raw_api_auth(request)
     if err:
         return err
 
@@ -11594,9 +11657,21 @@ async def api_bucket_update(request):
     event_date = str(body.get("date") or "").strip() if "date" in body else None
     proactive_eligible = body.get("proactive_eligible") if "proactive_eligible" in body else None
     clear_cooldown = bool(body.get("clear_cooldown", False))
+    pinned = body.get("pinned") if "pinned" in body else None
+    if pinned is not None and not isinstance(pinned, bool):
+        return JSONResponse({"error": "pinned must be a boolean"}, status_code=400)
+    core_group = str(body.get("core_group") or "").strip() if "core_group" in body else None
+    core_priority = body.get("core_priority") if "core_priority" in body else None
+    if core_priority is not None:
+        try:
+            core_priority = int(core_priority)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "core_priority must be an integer"}, status_code=400)
+        if core_priority < 0 or core_priority > 100:
+            return JSONResponse({"error": "core_priority must be 0-100"}, status_code=400)
 
-    if content is None and name is None and event_date is None and proactive_eligible is None and not clear_cooldown:
-        return JSONResponse({"error": "missing content, name, date, proactive_eligible, or clear_cooldown"}, status_code=400)
+    if content is None and name is None and event_date is None and proactive_eligible is None and pinned is None and not clear_cooldown and core_group is None and core_priority is None:
+        return JSONResponse({"error": "missing content, name, date, proactive_eligible, pinned, clear_cooldown, core_group, or core_priority"}, status_code=400)
     if event_date:
         normalized_date = local_date_key(event_date)
         if not normalized_date:
@@ -11608,6 +11683,8 @@ async def api_bucket_update(request):
         return JSONResponse({"error": "not found"}, status_code=404)
 
     meta = bucket.get("metadata", {})
+    if pinned is False and meta.get("protected"):
+        return JSONResponse({"error": "protected bucket cannot be unpinned"}, status_code=409)
     if content is not None:
         if not content:
             return JSONResponse({"error": "empty content"}, status_code=400)
@@ -11621,6 +11698,10 @@ async def api_bucket_update(request):
         update_kwargs["name"] = name or None
     if event_date is not None:
         update_kwargs["date"] = event_date
+    if pinned is not None:
+        update_kwargs["pinned"] = pinned
+        if not pinned:
+            update_kwargs["importance"] = 5
     if proactive_eligible is not None:
         extra = update_kwargs.get("extra_metadata") or {}
         extra["proactive_eligible"] = bool(proactive_eligible)
@@ -11628,6 +11709,14 @@ async def api_bucket_update(request):
     if clear_cooldown:
         extra = update_kwargs.get("extra_metadata") or {}
         extra["last_surfaced_at"] = ""
+        update_kwargs["extra_metadata"] = extra
+    if core_group is not None:
+        extra = update_kwargs.get("extra_metadata") or {}
+        extra["core_group"] = core_group
+        update_kwargs["extra_metadata"] = extra
+    if core_priority is not None:
+        extra = update_kwargs.get("extra_metadata") or {}
+        extra["core_priority"] = core_priority
         update_kwargs["extra_metadata"] = extra
     update_kwargs["last_active"] = meta.get("last_active") or meta.get("created")
 
