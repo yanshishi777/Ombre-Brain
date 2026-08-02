@@ -653,6 +653,12 @@ class GatewayService:
         self.core_budget = int(self.gateway_cfg.get("core_memory_budget", 500))
         self.recent_budget = int(self.gateway_cfg.get("recent_context_budget", 300))
         self.recalled_budget = int(self.gateway_cfg.get("recalled_memory_budget", 900))
+        # Response Examples：每轮固定注入的说话方式样本，放在 Core Memory 之后。
+        # 环境变量优先级更高，方便 Railway 不改代码就能覆盖；内容必须稳定以保护 prompt caching。
+        self.stable_response_examples = (
+            os.environ.get("OMBRE_STABLE_RESPONSE_EXAMPLES", "").strip()
+            or str(self.gateway_cfg.get("stable_response_examples", "") or "").strip()
+        )
         # 单次注入的长程记忆「条数」硬上限：只保留相关性最高的几条，避免无脑堆记忆。
         # 与 recalled_budget（token/字符上限）配合形成双上限；排序在预算填充之前完成，
         # 因此预算总是先喂给最相关的记忆，相关记忆不会被无关记忆挤掉。
@@ -783,6 +789,9 @@ class GatewayService:
         }
         self.current_inner_state_interval_rounds = max(
             0, int(self.gateway_cfg.get("current_inner_state_interval_rounds", 15))
+        )
+        self.persona_eval_enabled = self._bool_config_value(
+            self.gateway_cfg.get("persona_eval_enabled", True), True
         )
         self.relationship_weather_interval_rounds = max(
             0, int(self.gateway_cfg.get("relationship_weather_interval_rounds", 0))
@@ -1609,6 +1618,26 @@ class GatewayService:
             )
             self.gateway_cfg["current_inner_state_interval_rounds"] = self.current_inner_state_interval_rounds
             updated.append("gateway.current_inner_state_interval_rounds")
+        if "persona_eval_enabled" in payload:
+            self.persona_eval_enabled = self._bool_config_value(
+                payload["persona_eval_enabled"], True
+            )
+            self.gateway_cfg["persona_eval_enabled"] = self.persona_eval_enabled
+            updated.append("gateway.persona_eval_enabled")
+        if "relationship_weather_interval_rounds" in payload:
+            self.relationship_weather_interval_rounds = max(
+                0,
+                int(payload["relationship_weather_interval_rounds"]),
+            )
+            self.gateway_cfg["relationship_weather_interval_rounds"] = self.relationship_weather_interval_rounds
+            updated.append("gateway.relationship_weather_interval_rounds")
+        if "relationship_weather_budget" in payload:
+            self.relationship_weather_budget = max(
+                0,
+                int(payload["relationship_weather_budget"]),
+            )
+            self.gateway_cfg["relationship_weather_budget"] = self.relationship_weather_budget
+            updated.append("gateway.relationship_weather_budget")
         if "direct_render_mode" in payload:
             self.direct_render_mode = self._normalize_direct_render_mode(payload["direct_render_mode"])
             self.gateway_cfg["direct_render_mode"] = self.direct_render_mode
@@ -3065,7 +3094,8 @@ class GatewayService:
             "confidence": 0.0,
             "reason": "not_current_user_turn",
         }
-        core_memory = ""
+        core_memory_rules = ""
+        core_memory_background = ""
         portrait_memory = ""
         portrait_memory_debug: dict[str, Any] = self._portrait_memory_debug_base()
         just_now_context = ""
@@ -3254,7 +3284,7 @@ class GatewayService:
                 self.core_memory_interval_rounds,
             ):
                 stage_started_at = time.perf_counter()
-                core_memory = await self._build_core_memory_block(all_buckets)
+                core_memory_rules, core_memory_background = await self._build_core_memory_block(all_buckets)
                 mark_step("core_memory", stage_started_at)
             if needs_handoff_first or just_now_context_requested or date_recall_requested:
                 portrait_memory_debug["skip_reason"] = (
@@ -3618,7 +3648,8 @@ class GatewayService:
         stable_context, dynamic_context = self._build_injected_context_messages(
             persona_block=persona_block,
             conflict_nudge=conflict_nudge,
-            core_memory=core_memory,
+            core_memory_rules=core_memory_rules,
+            core_memory_background=core_memory_background,
             portrait_memory=portrait_memory,
             just_now_context=just_now_context,
             date_recall=date_recall,
@@ -4637,6 +4668,46 @@ class GatewayService:
                 round_id,
                 exc,
             )
+        if self.remote_brain_url and self.gateway_token and events:
+            try:
+                asyncio.ensure_future(self._forward_raw_events_to_brain(events))
+            except Exception as exc:
+                logger.warning(
+                    "Gateway raw event forward schedule failed | session=%s round=%s error=%s",
+                    session_id,
+                    round_id,
+                    exc,
+                )
+
+    async def _forward_raw_events_to_brain(self, events: list[dict]) -> None:
+        """Forward raw dialogue events to Brain /api/ingest-raw for centralized storage."""
+        if not self.remote_brain_url or not self.gateway_token:
+            return
+        try:
+            resp = await self.http_client.post(
+                f"{self.remote_brain_url}/api/ingest-raw",
+                headers={
+                    "Authorization": f"Bearer {self.gateway_token}",
+                    "Content-Type": "application/json",
+                },
+                json={"events": events, "source": "gateway"},
+                timeout=10.0,
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    "Gateway raw event forward to brain failed | status=%s body=%s",
+                    resp.status_code,
+                    resp.text[:200],
+                )
+            else:
+                result = resp.json()
+                logger.info(
+                    "Gateway raw event forward to brain ok | inserted=%s duplicate=%s",
+                    result.get("inserted", 0),
+                    result.get("duplicate", 0),
+                )
+        except Exception as exc:
+            logger.warning("Gateway raw event forward to brain error: %s", exc)
 
     async def _maybe_retry_with_memory_detail(
         self,
@@ -5377,6 +5448,12 @@ class GatewayService:
         if not self.persona_engine.enabled:
             logger.info(
                 "Persona post-reply update skipped | session=%s reason=disabled",
+                session_id,
+            )
+            return
+        if not self.persona_eval_enabled:
+            logger.info(
+                "Persona post-reply evaluation skipped | session=%s reason=persona_eval_disabled",
                 session_id,
             )
             return
@@ -8188,24 +8265,55 @@ class GatewayService:
             return text, False
         return text.replace(FAVORITE_MEMORY_MARKER, "").strip(), True
 
-    async def _build_core_memory_block(self, all_buckets: list[dict]) -> str:
+    _CORE_GROUP_RANK = {
+        "identity": 3,
+        "patterns": 2,
+        "hard_rule": 1,
+    }
+
+    def _core_group_rank(self, bucket: dict) -> int:
+        """固定桶组别排序权重：identity(3) > patterns(2) > hard_rule(1) > other(0)。旧桶无字段时回退到 0。"""
+        group = str(bucket.get("metadata", {}).get("core_group", "") or "").strip().lower()
+        return self._CORE_GROUP_RANK.get(group, 0)
+
+    async def _build_core_memory_block(self, all_buckets: list[dict]) -> tuple[str, str]:
+        """返回 (rules_text, background_text)。
+        rules_text: identity + patterns + hard_rule 组，是可执行指令。
+        background_text: other 组，是事实和背景信息。
+        两段分别注入，各自用不同前导。
+        """
         core_buckets = [
             bucket for bucket in all_buckets
             if not self._is_self_anchor_recall_excluded_bucket(bucket)
             and (bucket.get("metadata", {}).get("pinned") or bucket.get("metadata", {}).get("protected"))
         ]
+        # 固定区排序：组别 identity > patterns > hard_rule > other，
+        # 组内再按 core_priority > importance > last_active。
+        # 旧桶没有 core_group / core_priority 字段时安全回退到 other / 0。
         core_buckets.sort(
             key=lambda bucket: (
-                int(bucket.get("metadata", {}).get("importance", 0)),
-                bucket.get("metadata", {}).get("last_active", ""),
+                self._core_group_rank(bucket),
+                int(bucket.get("metadata", {}).get("core_priority", 0) or 0),
+                int(bucket.get("metadata", {}).get("importance", 0) or 0),
+                bucket.get("metadata", {}).get("last_active", "") or "",
             ),
             reverse=True,
         )
         # pinned/protected 桶走原文注入，不走 dehydrator 压缩
         # 保留原始指令语气（如"一个都不行""绝对不能用"），避免被摘要弱化成弱标签导致 AI 不遵守
-        parts = []
+        # 过滤 ### moment / ### reflection 等结构段，只注入正文主体
+        # 截断上限从 200 放宽到 400，让身份定义等核心内容能完整进去
+        _STRUCTURE_SECTION_RE = re.compile(r"\n#{2,4}\s+(moment|reflection|summary|evidence|raw_content)\b", re.IGNORECASE)
+        rules_parts = []
+        background_parts = []
         for bucket in core_buckets:
             content = str(bucket.get("content", "") or "").strip()
+            if not content:
+                continue
+            # 过滤 ### moment 及之后的结构段
+            cut = _STRUCTURE_SECTION_RE.search("\n" + content)
+            if cut:
+                content = content[:cut.start()].strip()
             if not content:
                 continue
             name = str(bucket.get("metadata", {}).get("name", "") or "").strip()
@@ -8213,19 +8321,34 @@ class GatewayService:
                 line = f"- [{name}] {content}"
             else:
                 line = f"- {content}"
-            parts.append(self._trim_text(line, 200))
-        result = "\n".join(parts)
+            # identity 组是人格底座，放宽到 800 让身份定义完整注入；其他组 400
+            group = str(bucket.get("metadata", {}).get("core_group", "") or "").strip().lower()
+            trim_limit = 800 if group == "identity" else 400
+            line = self._trim_text(line, trim_limit)
+            if group in ("identity", "patterns", "hard_rule"):
+                rules_parts.append(line)
+            else:
+                background_parts.append(line)
+        rules_text = "\n".join(rules_parts)
+        background_text = "\n".join(background_parts)
         max_chars = max(800, self.core_budget * 4)
-        if len(result) > max_chars:
-            result = result[:max_chars].rsplit("\n", 1)[0]
+        if len(rules_text) + len(background_text) > max_chars:
+            # 超预算时优先保留 rules，截断 background
+            remaining = max_chars - len(rules_text)
+            if remaining > 200:
+                background_text = background_text[:remaining].rsplit("\n", 1)[0]
+            else:
+                background_text = ""
         logger.info(
-            "Gateway core_memory build | all_buckets=%s core_buckets=%s budget=%s result_len=%s preview=%s",
+            "Gateway core_memory build | all_buckets=%s core_buckets=%s budget=%s rules_len=%s bg_len=%s preview=%s",
             len(all_buckets),
             len(core_buckets),
             self.core_budget,
-            len(result),
-            (result or "")[:160],
+            len(rules_text),
+            len(background_text),
+            (rules_text or "")[:160],
         )
+        return rules_text, background_text
         return result
 
     def _build_portrait_memory_block(self, all_buckets: list[dict]) -> tuple[str, dict[str, Any]]:
@@ -18490,7 +18613,8 @@ class GatewayService:
     def _build_injected_context_messages(
         self,
         persona_block: str,
-        core_memory: str,
+        core_memory_rules: str,
+        core_memory_background: str,
         portrait_memory: str,
         conflict_nudge: str = "",
         just_now_context: str = "",
@@ -18531,6 +18655,7 @@ class GatewayService:
                 proactive_memory,
             ]
         )
+        current_time_context = self._current_time_context()
         has_memory_reading_context = any(
             section.strip()
             for section in [
@@ -18547,26 +18672,49 @@ class GatewayService:
             ]
         )
         stable_sections = []
-        if core_memory.strip() or portrait_memory.strip():
-            stable_sections = [
-                "The following are core rules and pinned commitments. "
-                "You MUST strictly follow them in every reply — they are non-negotiable. "
-                "Do not mention memory lookup, search, or hidden context.",
-            ]
+        response_examples = self.stable_response_examples
+        has_stable_content = (
+            core_memory_rules.strip()
+            or core_memory_background.strip()
+            or portrait_memory.strip()
+            or response_examples.strip()
+        )
+        if has_stable_content:
+            stable_sections = []
 
             def add_stable_section(title: str, content: str) -> None:
                 if content.strip():
                     stable_sections.extend(["", title, content])
 
-            add_stable_section("Core Memory", core_memory)
+            # 规则段：identity + patterns + hard_rule，强硬措辞
+            if core_memory_rules.strip():
+                stable_sections.append(
+                    "The following are core rules and pinned commitments. "
+                    "You MUST strictly follow them in every reply — they are non-negotiable. "
+                    "Do not mention memory lookup, search, or hidden context."
+                )
+                add_stable_section("Core Memory", core_memory_rules)
+
+            # 背景段：other 组，温和措辞
+            if core_memory_background.strip():
+                stable_sections.append(
+                    "The following is background about her and your relationship. "
+                    "Use it to understand context and inform tone. "
+                    "It is not a list of commands."
+                )
+                add_stable_section("Background", core_memory_background)
+
+            add_stable_section("Response Examples", response_examples)
             add_stable_section("Portrait Memory", portrait_memory)
 
         dynamic_sections = []
-        if has_dynamic_context:
+        if has_dynamic_context or current_time_context.strip():
             dynamic_sections = [
                 "Live private context for the current turn. Use it quietly when relevant. "
                 "Prefer direct recall items as evidence for this query; use background associations only as background.",
             ]
+            if current_time_context.strip():
+                dynamic_sections.extend(["", "当前时间", current_time_context])
 
             def add_section(title: str, content: str) -> None:
                 if content.strip():
@@ -18632,6 +18780,17 @@ class GatewayService:
         if dynamic_tokens <= self.inject_total_budget:
             return stable_context, dynamic_context
         return stable_context, self._trim_text(dynamic_context, self.inject_total_budget)
+
+    def _current_time_context(self) -> str:
+        try:
+            now = datetime.now(self.gateway_tz)
+            weekday_cn = ["一", "二", "三", "四", "五", "六", "日"][now.weekday()]
+            return (
+                f"{now.year}年{now.month}月{now.day}日 周{weekday_cn} "
+                f"{now.hour:02d}:{now.minute:02d}（北京时间，UTC+8）"
+            )
+        except Exception:
+            return ""
 
     @staticmethod
     def _memory_reading_policy_context() -> str:
@@ -21935,6 +22094,75 @@ def create_gateway_app(
     async def upstream_usage_debug(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_upstream_usage_debug(request)
 
+    async def export_state(request: Request) -> Response:
+        import sqlite3
+        from starlette.responses import JSONResponse
+        gw = request.app.state.gateway_service
+        auth = request.headers.get("Authorization", "")
+        token = auth.replace("Bearer ", "").strip() if auth.startswith("Bearer ") else ""
+        if not gw.gateway_token or token != gw.gateway_token:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        turns = []
+        state_db = gw.state_store.db_path
+        if os.path.exists(state_db):
+            conn = sqlite3.connect(state_db)
+            conn.row_factory = sqlite3.Row
+            turns = [dict(row) for row in conn.execute("SELECT * FROM conversation_turns ORDER BY id")]
+            conn.close()
+        raw_events = []
+        raw_db = gw.raw_event_store.db_path
+        if os.path.exists(raw_db):
+            conn = sqlite3.connect(raw_db)
+            conn.row_factory = sqlite3.Row
+            raw_events = [dict(row) for row in conn.execute("SELECT id, source, source_event_id, role, text, created_at, conversation_id, session_id, client FROM raw_events ORDER BY id")]
+            conn.close()
+        dream_files = []
+        dreams_dir = getattr(getattr(gw, "dream_engine", None), "dreams_dir", None)
+        if dreams_dir:
+            for f in dreams_dir.rglob("*"):
+                if f.is_file():
+                    dream_files.append({"path": str(f.relative_to(dreams_dir)), "size": f.stat().st_size})
+        return JSONResponse({"conversation_turns": turns, "raw_events": raw_events, "dream_files": dream_files, "debug_paths": {"cwd": os.getcwd(), "state_db": os.path.abspath(state_db), "raw_db": os.path.abspath(raw_db), "state_db_exists": os.path.exists(state_db), "raw_db_exists": os.path.exists(raw_db)}})
+
+    async def import_state(request: Request) -> Response:
+        from starlette.responses import JSONResponse
+        gw = request.app.state.gateway_service
+        auth = request.headers.get("Authorization", "")
+        token = auth.replace("Bearer ", "").strip() if auth.startswith("Bearer ") else ""
+        if not gw.gateway_token or token != gw.gateway_token:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json"}, status_code=400)
+        turns = body.get("conversation_turns", [])
+        imported = 0
+        for turn in turns:
+            try:
+                gw.state_store.record_conversation_turn(
+                    profile_id=turn.get("profile_id", "default"),
+                    session_id=turn.get("session_id", ""),
+                    round_id=int(turn.get("round_id", 0) or 0),
+                    user_text=turn.get("user_text", ""),
+                    assistant_text=turn.get("assistant_text", ""),
+                    model=turn.get("model", ""),
+                    client=turn.get("client", ""),
+                    route=turn.get("route", ""),
+                    max_entries=500,
+                )
+                imported += 1
+            except Exception:
+                pass
+        events = body.get("raw_events", [])
+        raw_imported = 0
+        if events:
+            try:
+                result = gw.raw_event_store.ingest(events, source="gateway")
+                raw_imported = result.get("inserted", 0)
+            except Exception:
+                pass
+        return JSONResponse({"conversation_turns_imported": imported, "raw_events_imported": raw_imported})
+
     app = Starlette(
         debug=False,
         routes=[
@@ -21943,6 +22171,8 @@ def create_gateway_app(
             Route("/api/debug/injections", injection_debug, methods=["GET"]),
             Route("/api/hook/recall", hook_recall, methods=["POST"]),
             Route("/api/debug/recall-eval", recall_eval_debug, methods=["GET"]),
+            Route("/api/debug/export-state", export_state, methods=["GET"]),
+            Route("/api/debug/import-state", import_state, methods=["POST"]),
             Route("/api/debug/upstream-usage", upstream_usage_debug, methods=["GET"]),
             Route("/v1/models", models, methods=["GET"]),
             Route("/v1/chat/completions", chat_completions, methods=["POST"]),
