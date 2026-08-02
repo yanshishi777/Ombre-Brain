@@ -3939,11 +3939,15 @@ async def run_fix_formatted_buckets(dry_run: bool = True) -> dict:
             continue
         bucket_id = b["id"]
         raw = b.get("raw_content", "") or ""
-        tok = count_tokens_approx(content)
-        if tok < 100 and raw:
+        # 用 raw_content（干净原文）判断长短才准：content 带了 📌 header 会让 token 数偏高，
+        # 原本 <100 的短桶会被误判成长桶而只 strip header、丢失 [[引用]]。
+        raw_tok = count_tokens_approx(raw) if raw else count_tokens_approx(content)
+        if raw and raw_tok < 100:
+            # 短桶：直接还原为 raw_content 干净原文，恢复 [[引用]] 等关系
             new_content = raw
             mode = "restore_short"
         else:
+            # 长桶：仅去掉冗余 📌 header，保留脱水摘要
             new_content = _re.sub(r"^📌 记忆桶[^\n]*\n?", "", content)
             mode = "strip_header_long"
         if new_content == content:
