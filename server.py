@@ -11943,6 +11943,31 @@ async def api_search_raw(request):
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
+@mcp.custom_route("/api/raw-count", methods=["GET"])
+async def api_raw_count(request):
+    """Return raw_events count for the last N days, optionally filtered by source.
+
+    Used by the Gateway sync-health check (/api/raw-sync-check) to compare counts.
+    """
+    from starlette.responses import JSONResponse
+    err = _require_raw_api_auth(request)
+    if err:
+        return err
+    params = dict(getattr(request, "query_params", {}) or {})
+    try:
+        days = max(1, min(90, int(params.get("days", 7))))
+    except (TypeError, ValueError):
+        days = 7
+    source = str(params.get("source", "") or "")
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+    try:
+        count = raw_event_store.count_since(since=since, source=source)
+        return JSONResponse({"ok": True, "days": days, "source": source, "since": since, "count": count})
+    except Exception as exc:
+        logger.warning("raw count failed: %s", exc)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 @mcp.custom_route("/api/network", methods=["GET"])
 async def api_network(request):
     """Get embedding similarity network for visualization."""

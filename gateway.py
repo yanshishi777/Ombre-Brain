@@ -533,6 +533,12 @@ class GatewayService:
             os.path.join(config["buckets_dir"], "gateway_state.db")
         )
         self.raw_event_store = raw_event_store or RawEventStore(config)
+        retry_db = os.path.join(config["buckets_dir"], "raw_forward_retry.sqlite")
+        self.raw_forward_retry_store = RawForwardRetryStore(retry_db)
+        # 转发失败重试定时器间隔（秒）。0 或负数表示关闭后台重试（仅保留失败落盘，可手动补发）。
+        self.raw_forward_retry_interval_seconds = max(
+            0, int(self.gateway_cfg.get("raw_forward_retry_interval_seconds", 120))
+        )
         self.reminder_store = ReminderStore(config)
         self.persona_engine = persona_engine or PersonaStateEngine(config)
         self.dream_engine = dream_engine or DreamEngine(config)
@@ -2009,6 +2015,67 @@ class GatewayService:
         except Exception as exc:
             logger.exception("Gateway health check failed: %s", exc)
             return JSONResponse({"status": "error", "detail": str(exc)}, status_code=500)
+
+    async def handle_raw_sync_check(self, request: Request) -> JSONResponse:
+        """同步健康检查：对比 Gateway 本地与 Brain 两份原文表最近 N 天的条数。
+
+        返回 gateway_count / brain_count / diff（gateway - brain）以及转发队列待发数。
+        Brain 端按 source='gateway' 计数，只比"由网关转发的那部分"，避免把 Brain 自己
+        产生的其它来源算进来造成误报。
+        """
+        days = 7
+        try:
+            params = dict(request.query_params or {})
+            if params.get("days"):
+                days = max(1, min(90, int(params["days"])))
+        except (TypeError, ValueError):
+            days = 7
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+
+        # Gateway 本地原文表：只数来源为 gateway 的条目。
+        try:
+            gw_count = self.raw_event_store.count_since(since=since, source="gateway")
+        except Exception as exc:
+            logger.warning("raw_sync_check gateway count failed: %s", exc)
+            gw_count = None
+
+        # Brain 端：调 /api/raw-count，同样只数 gateway 来源。
+        brain_count = None
+        brain_error = None
+        if self.remote_brain_url and self.gateway_token:
+            try:
+                resp = await self.http_client.get(
+                    f"{self.remote_brain_url}/api/raw-count",
+                    headers={"Authorization": f"Bearer {self.gateway_token}"},
+                    params={"days": days, "source": "gateway"},
+                    timeout=10.0,
+                )
+                if resp.status_code == 200:
+                    brain_count = (resp.json() or {}).get("count")
+                else:
+                    brain_error = f"http_{resp.status_code}"
+            except Exception as exc:
+                brain_error = str(exc)[:200]
+        else:
+            brain_error = "brain_url_or_token_missing"
+
+        retry_stats = self.raw_forward_retry_store.stats()
+        diff = None
+        if isinstance(gw_count, int) and isinstance(brain_count, int):
+            diff = gw_count - brain_count
+        return JSONResponse(
+            {
+                "ok": True,
+                "window_days": days,
+                "since": since,
+                "gateway_count": gw_count,
+                "brain_count": brain_count,
+                "diff_gateway_minus_brain": diff,
+                "brain_error": brain_error,
+                "forward_retry_queue": retry_stats,
+                "note": "diff>0 表示 Gateway 比 Brain 多，可能是尚未同步或已丢失；0 表示健康。",
+            }
+        )
 
     async def handle_chat(self, request: Request) -> Response:
         auth_result = self._authorize(request.headers.get("Authorization", ""))
@@ -4688,7 +4755,11 @@ class GatewayService:
                 )
 
     async def _forward_raw_events_to_brain(self, events: list[dict]) -> None:
-        """Forward raw dialogue events to Brain /api/ingest-raw for centralized storage."""
+        """Forward raw dialogue events to Brain /api/ingest-raw for centralized storage.
+
+        转发失败时把这批 events 落进本地待发队列（raw_forward_retry_store），后台定时补发。
+        Brain 端按 source_event_id / event_hash 去重，重复补发不会产生重复记录。
+        """
         if not self.remote_brain_url or not self.gateway_token:
             return
         try:
@@ -4707,6 +4778,9 @@ class GatewayService:
                     resp.status_code,
                     resp.text[:200],
                 )
+                self.raw_forward_retry_store.enqueue(
+                    events, error=f"http_{resp.status_code}"
+                )
             else:
                 result = resp.json()
                 logger.info(
@@ -4716,6 +4790,52 @@ class GatewayService:
                 )
         except Exception as exc:
             logger.warning("Gateway raw event forward to brain error: %s", exc)
+            self.raw_forward_retry_store.enqueue(events, error=str(exc)[:500])
+
+    async def _run_raw_forward_retry_loop(self) -> None:
+        """后台重试定时器：定期把待发队列里到期的条目重新寄给 Brain。"""
+        if self.raw_forward_retry_interval_seconds <= 0:
+            logger.info("Raw forward retry loop disabled (interval<=0)")
+            return
+        while True:
+            await asyncio.sleep(self.raw_forward_retry_interval_seconds)
+            try:
+                if not self.remote_brain_url or not self.gateway_token:
+                    continue
+                due = self.raw_forward_retry_store.peek_due(limit=50)
+                if not due:
+                    continue
+                for row in due:
+                    try:
+                        payload = json.loads(row["payload_json"])
+                    except Exception:
+                        self.raw_forward_retry_store.mark_success(row["id"])
+                        continue
+                    try:
+                        resp = await self.http_client.post(
+                            f"{self.remote_brain_url}/api/ingest-raw",
+                            headers={
+                                "Authorization": f"Bearer {self.gateway_token}",
+                                "Content-Type": "application/json",
+                            },
+                            json={"events": payload, "source": "gateway"},
+                            timeout=10.0,
+                        )
+                        if resp.status_code == 200:
+                            self.raw_forward_retry_store.mark_success(row["id"])
+                        else:
+                            new_count = int(row["attempt_count"]) + 1
+                            self.raw_forward_retry_store.mark_failure(
+                                row["id"], attempt_count=new_count,
+                                error=f"http_{resp.status_code}",
+                            )
+                    except Exception as exc:
+                        new_count = int(row["attempt_count"]) + 1
+                        self.raw_forward_retry_store.mark_failure(
+                            row["id"], attempt_count=new_count, error=str(exc)[:500]
+                        )
+            except Exception as exc:
+                logger.warning("Raw forward retry loop error: %s", exc)
 
     async def _maybe_retry_with_memory_detail(
         self,
@@ -22137,6 +22257,7 @@ def create_gateway_app(
     @asynccontextmanager
     async def lifespan(app: Starlette):
         app.state.gateway_service = service
+        retry_task = asyncio.create_task(service._run_raw_forward_retry_loop())
         if gw_mcp is not None:
             async with gw_mcp.session_manager.run():
                 await service.warm_recall_runtime()
@@ -22146,6 +22267,7 @@ def create_gateway_app(
             await service.warm_recall_runtime()
             yield
             await service.close()
+        retry_task.cancel()
 
     async def health(request: Request) -> JSONResponse:
         return await request.app.state.gateway_service.handle_health(request)
@@ -22161,6 +22283,62 @@ def create_gateway_app(
 
     async def config_route(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_config(request)
+
+    async def raw_sync_check(request: Request) -> Response:
+        return await request.app.state.gateway_service.handle_raw_sync_check(request)
+
+    async def raw_forward_retry_debug(request: Request) -> Response:
+        svc = request.app.state.gateway_service
+        stats = svc.raw_forward_retry_store.stats()
+        due = svc.raw_forward_retry_store.peek_due(limit=200)
+        # 手动强制重试：把到期/未超次数的条目立刻重新寄出（不重置退避）。
+        if request.method == "POST":
+            resent = 0
+            errors = 0
+            for row in due:
+                try:
+                    payload = json.loads(row["payload_json"])
+                except Exception:
+                    svc.raw_forward_retry_store.mark_success(row["id"])
+                    continue
+                try:
+                    resp = await svc.http_client.post(
+                        f"{svc.remote_brain_url}/api/ingest-raw",
+                        headers={
+                            "Authorization": f"Bearer {svc.gateway_token}",
+                            "Content-Type": "application/json",
+                        },
+                        json={"events": payload, "source": "gateway"},
+                        timeout=10.0,
+                    )
+                    if resp.status_code == 200:
+                        svc.raw_forward_retry_store.mark_success(row["id"])
+                        resent += 1
+                    else:
+                        svc.raw_forward_retry_store.mark_failure(
+                            row["id"],
+                            attempt_count=int(row["attempt_count"]) + 1,
+                            error=f"http_{resp.status_code}",
+                        )
+                        errors += 1
+                except Exception as exc:
+                    svc.raw_forward_retry_store.mark_failure(
+                        row["id"],
+                        attempt_count=int(row["attempt_count"]) + 1,
+                        error=str(exc)[:500],
+                    )
+                    errors += 1
+            return JSONResponse(
+                {"ok": True, "resent": resent, "errors": errors, "queue_after": svc.raw_forward_retry_store.stats()}
+            )
+        return JSONResponse(
+            {
+                "ok": True,
+                "stats": stats,
+                "due_count": len(due),
+                "note": "POST 此端点可立即强制重试队列中所有到期条目。",
+            }
+        )
 
     async def injection_debug(request: Request) -> Response:
         return await request.app.state.gateway_service.handle_injection_debug(request)
@@ -22248,6 +22426,8 @@ def create_gateway_app(
         routes=[
             Route("/health", health, methods=["GET"]),
             Route("/api/config", config_route, methods=["GET", "POST"]),
+            Route("/api/raw-sync-check", raw_sync_check, methods=["GET"]),
+            Route("/api/debug/raw-forward-retry", raw_forward_retry_debug, methods=["GET", "POST"]),
             Route("/api/debug/injections", injection_debug, methods=["GET"]),
             Route("/api/hook/recall", hook_recall, methods=["POST"]),
             Route("/api/debug/recall-eval", recall_eval_debug, methods=["GET"]),
@@ -22272,6 +22452,138 @@ def create_gateway_app(
     else:
         logger.warning("MCP mount skipped: gw_mcp is None (gateway runs without /mcp)")
     return app
+
+
+class RawForwardRetryStore:
+    """本地待发队列：转发 Brain 失败时把条目落盘，后台定时补发。
+
+    设计要点（用大白话）：
+    - 每次转发失败，就把那批 events 原文 + 失败次数 + 下次重试时间写进本地 sqlite。
+    - 后台定时器每隔几分钟来扫一次，把"到时间了且还没超次数"的条目重新寄给 Brain。
+    - Brain 的 /api/ingest-raw 本身按 source_event_id / event_hash 去重，所以即使网关重启、
+      同一条被寄两次也只会存一次，不会重复。
+    - 队列跟着 gateway_state.db 同一个目录（buckets_dir），8 月 4 号挂的 Volume 能一并持久化，
+      重启不丢。
+    """
+
+    MAX_ATTEMPTS = 8
+
+    def __init__(self, db_path: str):
+        self.db_path = str(db_path)
+        os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        conn = self._connect()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS raw_forward_retry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payload_json TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TEXT NOT NULL,
+                first_failed_at TEXT NOT NULL,
+                last_error TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_retry_next ON raw_forward_retry(next_attempt_at)"
+        )
+        conn.commit()
+        conn.close()
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    @staticmethod
+    def _iso_after(seconds: float) -> str:
+        return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat(timespec="seconds")
+
+    def enqueue(self, events: list[dict[str, Any]], *, error: str = "") -> None:
+        """把一批转发失败的 events 存进待发队列。"""
+        if not events:
+            return
+        now = self._now_iso()
+        payload = json.dumps(events, ensure_ascii=False)
+        # 指数退避：首次等 30 秒，之后逐渐拉长，但封顶 30 分钟。
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO raw_forward_retry
+                (payload_json, attempt_count, next_attempt_at, first_failed_at, last_error)
+                VALUES (?, 0, ?, ?, ?)
+                """,
+                (payload, self._iso_after(30), now, str(error or "")[:500]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        logger.warning(
+            "Raw forward retry enqueued | events=%d error=%s", len(events), str(error or "")[:120]
+        )
+
+    def peek_due(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        """取出所有"到时间且未超次数"的待发条目。"""
+        now = self._now_iso()
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT * FROM raw_forward_retry
+                WHERE next_attempt_at <= ? AND attempt_count < ?
+                ORDER BY next_attempt_at ASC
+                LIMIT ?
+                """,
+                (now, self.MAX_ATTEMPTS, max(1, min(500, int(limit or 50)))),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def mark_success(self, row_id: int) -> None:
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM raw_forward_retry WHERE id = ?", (row_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def mark_failure(self, row_id: int, *, attempt_count: int, error: str = "") -> None:
+        # 退避：base 30s * 2^attempt，封顶 1800s（30 分钟）。
+        backoff = min(1800.0, 30.0 * (2 ** max(0, attempt_count)))
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                UPDATE raw_forward_retry
+                SET attempt_count = ?, next_attempt_at = ?, last_error = ?
+                WHERE id = ?
+                """,
+                (attempt_count, self._iso_after(backoff), str(error or "")[:500], row_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def stats(self) -> dict[str, Any]:
+        conn = self._connect()
+        try:
+            total = conn.execute("SELECT COUNT(*) AS c FROM raw_forward_retry").fetchone()["c"]
+            dead = conn.execute(
+                "SELECT COUNT(*) AS c FROM raw_forward_retry WHERE attempt_count >= ?",
+                (self.MAX_ATTEMPTS,),
+            ).fetchone()["c"]
+            return {"total": int(total), "exhausted": int(dead), "pending": int(total) - int(dead)}
+        finally:
+            conn.close()
 
 
 def main() -> None:

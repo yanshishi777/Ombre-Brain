@@ -238,6 +238,24 @@ class RawEventStore:
             "items": [self._row_to_event(row) for row in rows],
         }
 
+    def count_since(self, *, since: str, source: str = "") -> int:
+        """返回 created_at >= since 的条数（可选按 source 过滤）。用于同步健康检查。"""
+        conn = self._connect()
+        try:
+            if source:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS c FROM raw_events WHERE created_at >= ? AND source = ?",
+                    (str(since), self._clean_source(source)),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS c FROM raw_events WHERE created_at >= ?",
+                    (str(since),),
+                ).fetchone()
+            return int(row["c"]) if row else 0
+        finally:
+            conn.close()
+
     def list_events_between(
         self,
         *,
