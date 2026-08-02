@@ -300,9 +300,17 @@ DATE_RECALL_BROAD_QUERY_MARKERS = frozenset(
         "有什么事", "有什么事吗", "在干嘛", "在干什么", "在做什么", "在干啥",
         "去干嘛", "来干嘛", "来做什么", "来干什么", "在聊什么", "说了什么",
         "聊了什么", "提了什么", "玩什么", "做了啥", "干了啥", "弄什么", "搞什么",
-        "搞了什么", "整什么", "干嘛了", "干什么了", "聊啥", "说啥", "提啥",
+        "搞了什么", "整什么", "干嘛了", "干什么了",         "聊啥", "说啥", "提啥",
     }
 )
+# 显式“在问某天发生了什么”的查询意图标记。命中其一即视为有查询意图。
+# 注意：“那天/那次/当时/那会儿/那阵子”既在此处（意图），也在 DATE_RECALL_DEICTIC_MARKERS（指代性日期）。
+DATE_RECALL_QUERY_INTENT_MARKERS = (
+    "记得吗", "还记得", "记不记得",
+    "那天", "那次", "当时", "那会儿", "那阵子",
+)
+# 指代性日期：句子里没有“今天/昨天/具体日期”，但有这类词时，回退到最近有记录的一天。
+DATE_RECALL_DEICTIC_MARKERS = ("那天", "那次", "当时", "那会儿", "那阵子")
 # 剥掉疑问词/助词后，若只剩这些泛化动作动词（如“干/做/发生/来/去”），也算泛化日期查询。
 _DATE_RECALL_GENERIC_VERBS = frozenset(
     {"干", "做", "发生", "来", "去", "有", "是", "搞", "整", "弄", "玩", "搞啥", "整啥", "弄啥"}
@@ -8524,7 +8532,7 @@ class GatewayService:
         if self.date_recall_budget <= 0:
             debug["skip_reason"] = "budget_disabled"
             return "", debug, []
-        hint = self._query_date_recall_hint(query_text)
+        hint = self._resolve_date_recall_hint(query_text)
         if not hint:
             debug["skip_reason"] = "no_date_hint"
             return "", debug, []
@@ -8778,7 +8786,10 @@ class GatewayService:
 
     def _query_requests_date_recall(self, query: str) -> bool:
         text = str(query or "").strip()
-        if not text or not self._query_date_recall_hint(text):
+        if not text:
+            return False
+        # 必须有可解析的日期：今天/昨天/具体日期，或“那天/那次/当时”等指代性日期。
+        if not self._resolve_date_recall_hint(text):
             return False
         if self._query_prefers_identity_name_over_date_recall(text):
             return False
@@ -8791,9 +8802,14 @@ class GatewayService:
         )
         if plain_today_status:
             return False
-        if any(marker in text for marker in DATE_RECALL_CHAT_MARKERS):
+        # 否定陈述（没什么事 / 没事 / 没发生）不算在问某天的事，跳过 chat_markers 直接触发。
+        negated_statement = any(
+            n in text for n in ("没什么", "没事", "没有事", "没发生", "未发生", "无其事")
+        )
+        if not negated_statement and any(marker in text for marker in DATE_RECALL_CHAT_MARKERS):
             return True
-        return self._query_has_explicit_date_topic(text)
+        # 其余情况必须显式具备“查询意图”才触发（已去掉原先“剥掉日期词后还有中文就触发”的兜底）。
+        return self._query_has_date_recall_intent(text)
 
     def _query_is_broad_date_recall(self, query: str) -> bool:
         """用户只是在泛泛地问某天“干了什么/发生了什么/怎么样”，没有具体主题。"""
@@ -8846,6 +8862,70 @@ class GatewayService:
         if not text:
             return None
         return parse_human_date_reference(text, now=datetime.now(self.gateway_tz), tz=self.gateway_tz)
+
+    def _resolve_date_recall_hint(self, query: str) -> dict[str, str] | None:
+        """解析日期召回所需的日期键。
+
+        先按显式日期词（今天/昨天/具体日期）解析；若没有显式日期但含指代性日期
+        （那天/那次/当时/那会儿/那阵子），则回退到最近有对话记录的一天，使
+        “你还记得那天我们聊的事吗”这类问法也能触发日期召回。
+        """
+        hint = self._query_date_recall_hint(query)
+        if hint:
+            return hint
+        text = str(query or "")
+        for marker in DATE_RECALL_DEICTIC_MARKERS:
+            if marker in text:
+                date_key = self._most_recent_active_date_key(days=30)
+                if date_key:
+                    return {"date": date_key, "label": marker}
+                break
+        return None
+
+    def _most_recent_active_date_key(self, days: int = 30) -> str | None:
+        """返回最近 days 天内有对话记录的那一天的 YYYY-MM-DD；无记录则返回 None。"""
+        try:
+            now = datetime.now(self.gateway_tz)
+            start_at = now - timedelta(days=days)
+            profile_id = str(getattr(self.persona_engine, "profile_id", "") or "default")
+            turns = self.state_store.list_conversation_turns_between(
+                profile_id=profile_id, start_at=start_at, end_at=now, limit=200
+            )
+            if not turns:
+                return None
+            dates = [str(t.get("created_at") or "")[:10] for t in turns if t.get("created_at")]
+            dates = [d for d in dates if len(d) == 10]
+            return max(dates) if dates else None
+        except Exception:
+            return None
+
+    def _query_has_date_recall_intent(self, query: str) -> bool:
+        """判断是否具有“在问某天发生了什么”的查询意图。
+
+        命中以下任一即视为有意图：
+        - 显式表述标记（记得吗/还记得/那天/那次/当时…）
+        - 疑问句式（问号、句末“吗/呢”、或含疑问词）
+        """
+        text = str(query or "").strip()
+        if any(marker in text for marker in DATE_RECALL_QUERY_INTENT_MARKERS):
+            return True
+        return self._is_interrogative(text)
+
+    def _is_interrogative(self, query: str) -> bool:
+        text = str(query or "").strip()
+        if not text:
+            return False
+        if "？" in text or "?" in text:
+            return True
+        if text.rstrip("。！，,.!；; ").endswith(("吗", "呢")):
+            return True
+        # “没什么/没有什么”是否定陈述，不算疑问句。
+        if "没什么" in text or "没有什么" in text:
+            return False
+        return any(
+            w in text
+            for w in ("什么", "怎么", "为什么", "哪", "谁", "几", "多少", "咋", "啥", "何时")
+        )
 
     def _date_recall_range(self, date_key: str) -> tuple[datetime, datetime]:
         target = datetime.fromisoformat(f"{date_key}T00:00:00").replace(tzinfo=self.gateway_tz)
