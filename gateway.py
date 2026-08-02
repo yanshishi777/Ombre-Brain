@@ -2072,8 +2072,10 @@ class GatewayService:
                 "brain_count": brain_count,
                 "diff_gateway_minus_brain": diff,
                 "brain_error": brain_error,
+                # 已放弃（重试 8 次仍失败、留在库里等手动处理）的条数提到顶层，避免变死角。
+                "abandoned_in_queue": retry_stats.get("abandoned", 0),
                 "forward_retry_queue": retry_stats,
-                "note": "diff>0 表示 Gateway 比 Brain 多，可能是尚未同步或已丢失；0 表示健康。",
+                "note": "diff>0 表示 Gateway 比 Brain 多，可能是尚未同步或已丢失；abandoned_in_queue>0 表示有条目重试耗尽需手动处理（POST /api/debug/raw-forward-retry 可强制补发）。",
             }
         )
 
@@ -22581,7 +22583,12 @@ class RawForwardRetryStore:
                 "SELECT COUNT(*) AS c FROM raw_forward_retry WHERE attempt_count >= ?",
                 (self.MAX_ATTEMPTS,),
             ).fetchone()["c"]
-            return {"total": int(total), "exhausted": int(dead), "pending": int(total) - int(dead)}
+            return {
+                "total": int(total),
+                "exhausted": int(dead),
+                "abandoned": int(dead),
+                "pending": int(total) - int(dead),
+            }
         finally:
             conn.close()
 
