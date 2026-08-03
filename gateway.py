@@ -3,6 +3,7 @@ import hashlib
 import os
 import re
 import secrets
+import sqlite3
 import json
 import codecs
 import time
