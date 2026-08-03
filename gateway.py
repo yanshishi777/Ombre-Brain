@@ -21723,6 +21723,8 @@ class GatewayService:
             self.relevance_options,
         ):
             return False
+        if meta.get("pinned") or meta.get("protected"):
+            return False
 
         query_active = active_facets(facets_for_text(query, self.relevance_options))
         if not query_active:
@@ -21762,6 +21764,8 @@ class GatewayService:
             return False
         if meta.get("resolved") or meta.get("digested"):
             return False
+        if meta.get("pinned") or meta.get("protected"):
+            return False
         identity_keys = {
             self._compact_lookup_key(value)
             for value in (
@@ -21799,6 +21803,8 @@ class GatewayService:
         if meta.get("type") in {"feel", "archived"}:
             return False
         if meta.get("resolved") or meta.get("digested"):
+            return False
+        if meta.get("pinned") or meta.get("protected"):
             return False
         return bool(bucket.get("id"))
 
