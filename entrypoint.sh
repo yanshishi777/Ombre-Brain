@@ -13,7 +13,7 @@ if [ "$OMBRE_SERVICE_ROLE" = "gateway" ]; then
   fi
   # background pull loop every 5 min
   (while true; do sleep 300; git -C /data pull --rebase >/dev/null 2>&1 || true; done) &
-  echo "[entrypoint] starting gateway (buckets from /data/ombre)"
+  echo "[entrypoint] starting gateway (buckets from ${OMBRE_BUCKETS_DIR:-/app/buckets})"
   exec python gateway.py
 else
   echo "[entrypoint] starting brain"
