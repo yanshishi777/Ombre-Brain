@@ -378,6 +378,11 @@ gateway:
       models:
         - id: "juzi-opus-4-6-thinking"
           upstream_model: "[金汤力]claude-opus-4-6-thinking"
+  # 每轮是否往动态上下文里注入「当前时间」。
+  # 默认 false —— Hermes WebUI 的 timestamp 扩展已经在每条用户消息开头
+  # 写了 [2026年8月9日 星期六 09:30]，网关再注一次是重复，两边格式还不一致。
+  # 如果换成不带时间戳的客户端，把这里改成 true。
+  inject_current_time: false
   head_recent_hours: 72
   recent_context_reentry_idle_hours: 24
   recent_context_cooldown_hours: 6

@@ -18858,7 +18858,15 @@ class GatewayService:
                 proactive_memory,
             ]
         )
-        current_time_context = self._current_time_context()
+        # [2026-08-09] 客户端（Hermes WebUI 的 timestamp 扩展）已经在每条用户消息
+        # 开头写入 [2026年8月9日 星期六 09:30]，网关这层再注一次是重复，
+        # 而且两边格式不一致容易让模型困惑。由 gateway.inject_current_time 控制，
+        # 默认关闭；想恢复就在 config 里把它设成 true。
+        current_time_context = (
+            self._current_time_context()
+            if self.gateway_cfg.get("inject_current_time", False)
+            else ""
+        )
         has_memory_reading_context = any(
             section.strip()
             for section in [
