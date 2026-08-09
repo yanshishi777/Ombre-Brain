@@ -329,11 +329,19 @@ gateway:
         - "deepseek-chat"
         - "deepseek-reasoner"
     - name: "zhongzhuan"
-      protocol: "openai"
+      # TeamoRouter 文档明确要求：Claude 模型必须走 Anthropic 原生协议 /v1/messages。
+      # 用 OpenAI 兼容格式调 Claude 会丢掉 prompt cache 和 thinking 能力。
+      # 实测（2026-08-09）：openai 协议下 cache 写入成功但读取恒为 0，
+      # thinking 参数被吞、响应无 reasoning_content。
+      protocol: "anthropic"
       base_url: "https://api.teamorouter.com/v1"
       api_key_env: "OMBRE_GATEWAY_ZHONGZHUAN_API_KEY"
       default_model: "claude-sonnet-4-6"
-      prompt_cache: ""
+      # Anthropic 协议路径不会像 openai 路径那样对 Claude 自动打缓存断点，
+      # 必须显式声明（见 gateway.py:_apply_anthropic_prompt_cache）。
+      prompt_cache: "anthropic_explicit"
+      # 缓存默认 5 分钟 TTL，聊天场景间隔常超过，延到 1 小时。
+      prompt_cache_ttl: "1h"
       models:
         - "claude-sonnet-4-6"
         - "claude-sonnet-5"
